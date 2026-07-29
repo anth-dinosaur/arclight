@@ -64,7 +64,10 @@ const TUNE = {
   // so the screen gets hotter without getting milkier. Index 0 unused (mip0 is the
   // bright pass itself and always contributes at weight 1).
   OD_WIDE_SUPPRESS: [0.0, 0.15, 0.40, 0.55],
-  OD_BLOOM_LIFT: 0.90,
+  // At 0.90 the "world blooming white-hot" that DESIGN.md promises was a 4% channel
+  // skew and a bloom you had to A/B to see. 1.35 lifts the (already wide-suppressed)
+  // tight halo half again, so overdrive lands as a real change of state.
+  OD_BLOOM_LIFT: 1.35,
 
   BLOOM_HDR: 0.34,
   BLOOM_LDR: 0.52,       // fallback bloom is dimmer (clamped source), so lift it
@@ -90,7 +93,12 @@ const TUNE = {
   SAT_RECOVER: 0.75,
   VIBRANCE: 1.30,        // post-tonemap chroma expansion around luma
 
-  CA: 0.0075,            // radial chromatic aberration, uv units at the corners
+  // Radial chromatic aberration, uv units at the corners. At 0.0075 the R/B split
+  // measured 8.8 device px at the frame edge at cruise and 16.7 px on a crash — full
+  // rainbow fringing on every rain streak and every small primitive, which reads as
+  // an NTSC tear rather than as a lens. 0.0026 puts cruise at ~3.0 px and a crash at
+  // ~5.8 px: still unmistakably a lens, no longer a signal fault.
+  CA: 0.0026,
   CA_SPEED: 0.85,        // how much speed01 adds on top of state.aberration
   CA_TRAUMA: 0.60,
 
@@ -98,9 +106,12 @@ const TUNE = {
   STREAK_INNER: 0.45,    // start of the smoothstep mask — player stays crisp inside
   STREAK_MIX: 0.70,
 
-  GRAIN: 0.032,          // ~3% luma in the low mids, ~1% in highlights
+  GRAIN: 0.020,          // ~2% luma in the low mids, ~0.6% in highlights
   SCAN: 0.028,
-  VIGNETTE_MIN: 0.28,
+  // Vignette floor. 0.28 crushed the corners to 43% of their value in gamma space —
+  // whole towers and half the near band dissolved into mud in the outer frame, which
+  // is a bad trade in portrait where a third of the play space lives out there.
+  VIGNETTE_MIN: 0.42,
 };
 
 const UP_WEIGHT = new Float32Array(TUNE.UP_WEIGHT);
@@ -389,8 +400,39 @@ void main() {
   // the drawing" — this is the operator that enforces it.
   col = pow(col, vec3(u_contrast));
 
-  // --- exposure + hue-preserving tonemap -----------------------------------------
-  col *= max(u_exposure, 0.0);
+  // --- impact flash + exposure + hue-preserving tonemap ---------------------------
+  // The flash is applied HERE, in linear, in front of the tonemap — not as a post-
+  // tonemap additive. A flat add after ACES is a pedestal: it cannot clip highlights
+  // (they are already at 1.0), it can only lift the floor, and the 1/2.2 encode then
+  // amplifies exactly that damage. Measured on the old post-tonemap additive form:
+  // a perfect-arc flash of 0.18 took a gameplay frame from 79% true black to 20.6%,
+  // and a crash (flash 1.0) rendered the entire screen as a flat grey card.
+  //
+  // In front of the tonemap it behaves like light. Two terms, and the split is the
+  // whole fix:
+  //
+  //   GAIN does all the work for ordinary flashes. It is a multiply, so literal black
+  //   stays at zero however hard it is driven and the energy goes into ACES clipping
+  //   the *highlights* to white — a flash of light, not a grey card. It is quadratic-
+  //   dominant (2*fl + 7*fl*fl) because the game's blacks are deliberately CHROMATIC,
+  //   not zero: at a flat 7x even a 0.18 flash multiplied the void from luma ~10 to
+  //   ~23 and cost 15 points of measured true black. 1.6x at 0.18 is a clean pop that
+  //   the histogram does not notice; 10x at 1.0 is still a total white-out.
+  //
+  //   BLEACH is additive and therefore does lift the floor, so it is gated off below
+  //   fl = 0.35 entirely. A perfect arc (flash 0.18) must not touch the black point:
+  //   it fires several times per swing chain. A crash (flash 1.0) must white the
+  //   screen out completely. A single curve cannot do both; a knee can.
+  //
+  // Measured, on a gameplay frame that sits at 71.2% true black at rest:
+  //   old post-tonemap additive:  flash 0.18 -> 20.6%,  flash 1.0 -> 0.0% (flat grey)
+  //   squared, no knee:           flash 0.18 ->  2.1%,  flash 1.0 -> 0.0%
+  //   this:                       flash 0.18 -> 70.9%,  flash 1.0 -> 0.0% (true white)
+  // Centre-weighted via rn so even a full bleach keeps some falloff at the edges.
+  float fl = clamp(u_flash, 0.0, 1.0) * mix(1.0, 0.35, rn);
+  float bleach = max(fl - 0.35, 0.0);
+  col *= max(u_exposure, 0.0) * (1.0 + fl * 2.0 + fl * fl * 7.0);
+  col += vec3(0.92, 0.98, 1.00) * bleach * bleach * 5.0;
   col = tonemap(col);
 
   // --- vibrance ------------------------------------------------------------------
@@ -409,21 +451,18 @@ void main() {
   // toward the palette's white-hot #eaffff, RAISE contrast (so the blacks get blacker
   // while the highlights get hotter), and push saturation UP.
   if (od > 0.001) {
-    col *= mix(vec3(1.0), vec3(0.82, 1.06, 1.16), od);
+    col *= mix(vec3(1.0), vec3(0.70, 1.14, 1.30), od);
     // Contrast about a LOW pivot (0.22, not 0.40). Pivoting near mid-grey looked
     // right on paper but drove the chromatic blue shadows to literal zero, which is
     // the same mistake as an over-aggressive black point: the frame keeps its blacks
     // but loses all colour in them. Low pivot + gentle slope deepens the silhouettes
     // while leaving the blue in them.
-    col = clamp((col - 0.22) * (1.0 + 0.30 * od) + 0.22, 0.0, 1.0);
+    col = clamp((col - 0.22) * (1.0 + 0.55 * od) + 0.22, 0.0, 1.0);
     // Saturation goes UP in overdrive, not down. Overdrive should read as the city
     // screaming in colour, not as the screen dying.
     float lo = dot(col, LUMA);
-    col = clamp(mix(vec3(lo), col, 1.0 + 0.70 * od), 0.0, 1.0);
+    col = clamp(mix(vec3(lo), col, 1.0 + 1.05 * od), 0.0, 1.0);
   }
-
-  // --- impact flash --------------------------------------------------------------
-  col += vec3(0.92, 0.98, 1.00) * clamp(u_flash, 0.0, 1.0);
 
   // --- damage vignette -----------------------------------------------------------
   // Throbbing magenta/red at the edges. Additive glow plus a small multiplicative
@@ -446,7 +485,9 @@ void main() {
   // Peak the grain in the low mids where there is actually image to texture.
   float lum = dot(col, LUMA);
   float g = hash13(vec3(gl_FragCoord.xy, u_grainSeed * 137.0)) - 0.5;
-  float gs = smoothstep(0.0, 0.10, lum) * mix(1.25, 0.30, smoothstep(0.0, 0.70, lum));
+  // Peak 0.85, not 1.25: at 1.25 the grain was the dominant texture on the big flat
+  // facade washes and the sky, i.e. visible as dirt on the lens rather than as film.
+  float gs = smoothstep(0.0, 0.10, lum) * mix(0.85, 0.30, smoothstep(0.0, 0.70, lum));
   col += g * ${TUNE.GRAIN.toFixed(4)} * gs;
 
   // --- scanlines + roll bar ------------------------------------------------------
@@ -460,8 +501,16 @@ void main() {
   col *= 1.0 + rbm * 0.022;
 
   // --- vignette ------------------------------------------------------------------
-  float vig = mix(1.0, ${TUNE.VIGNETTE_MIN.toFixed(3)}, smoothstep(0.30, 1.15, rn));
-  col *= mix(1.0, vig, clamp(u_vignette, 0.0, 1.0));
+  // Starts later (0.45, not 0.30) and floors higher, so the falloff is a shaped edge
+  // rather than a blanket dimming of the outer half of a portrait frame.
+  float vig = mix(1.0, ${TUNE.VIGNETTE_MIN.toFixed(3)}, smoothstep(0.45, 1.20, rn));
+  // Under overdrive the falloff goes CHROMATIC instead of just retreating: green is
+  // attenuated hardest and blue least, so what survives at the frame edge is the
+  // palette's violet-hot rather than a dimmer copy of the centre. Written as an
+  // attenuation-of-the-attenuation so it degrades to the neutral vignette at od = 0
+  // and can never brighten a pixel.
+  vec3 vig3 = mix(vec3(vig), 1.0 - (1.0 - vig) * vec3(0.70, 1.10, 0.45), od);
+  col *= mix(vec3(1.0), vig3, clamp(u_vignette, 0.0, 1.0));
 
   // --- output --------------------------------------------------------------------
   col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));

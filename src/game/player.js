@@ -152,10 +152,37 @@ const P_ANG_MID  = (P_ANG_MIN + P_ANG_MAX) * 0.5;
 const P_ANG_HALF = (P_ANG_MAX - P_ANG_MIN) * 0.5;
 const P_MIN_SPEED = CFG.PERFECT_MIN_SPEED;
 const P_IMPULSE   = CFG.PERFECT_IMPULSE;
+/**
+ * THE PERFECT-ARC WINDOW, RESTATED IN ROPE ANGLE.
+ *
+ * While the rope is taut the velocity is purely tangential, so with n̂ = (cos phi,
+ * sin phi) pointing anchor->player and a forward (phi-decreasing) swing:
+ *     v = |vt| * (sin phi, -cos phi)   =>   atan2(-vy, vx) = PI/2 - phi
+ * The velocity-angle window is therefore EXACTLY a phi window, and phi is a
+ * quantity we can extrapolate — which is what makes a predictive cue possible at
+ * all. phi sweeps DOWNWARD through the window: it opens at P_PHI_MAX and closes at
+ * P_PHI_MIN, roughly 0.29s later at cruise.
+ */
+const P_PHI_MAX  = Math.PI * 0.5 - P_ANG_MIN;
+const P_PHI_MIN  = Math.PI * 0.5 - P_ANG_MAX;
+/** Seconds of lead on the cue. Human reaction is ~250ms; a cue that switches on at
+ *  the instant the window opens (which is what reading it off CURRENT velocity did)
+ *  is late by construction and cannot be acted on. */
+const P_ETA_LEAD = CFG.PERFECT_ETA_LEAD ?? 0.35;
 
 const GRAZE_RADIUS   = CFG.GRAZE_RADIUS;
 const GRAZE_COOLDOWN = CFG.GRAZE_COOLDOWN;
 const FLOODLINE      = CFG.FLOODLINE;
+/**
+ * Anchors are the most numerous neon geometry in the game and were never scanned,
+ * which is most of why GRAZE was dead (measured 2.0/run; adding anchors to the scan
+ * takes it to ~22/run, where tripling the radius only reached 3.3). DESIGN.md L3
+ * says "neon geometry OR a hazard", and skimming an anchor you deliberately did NOT
+ * grab is precisely the L4 line-choice expression the layer is supposed to reward.
+ * The anchor currently held and the one just auto-hopped off are excluded — you
+ * cannot graze what you are attached to.
+ */
+const GRAZE_ANCHORS  = CFG.GRAZE_ANCHORS !== false;
 
 // Glancing blows deflect instead of killing. Measured from the surface TANGENT.
 const DEFLECT_ANGLE  = CFG.DEFLECT_ANGLE;                 // ~46°
@@ -287,10 +314,26 @@ export class Player {
     this.trailTimer = 0;
     this.inPerfectWindow = false;
 
+    // ---- perfect-arc telegraph (predictive; read by HUD + renderer) --------
+    /** Seconds until the perfect window OPENS. 0 = open now, -1 = not coming. */
+    this.perfectETA = -1;
+    /** 0..1 ramp for the cue: rises over the last PERFECT_ETA_LEAD seconds before
+     *  the window opens, holds at 1 while it is open. This is the signal a human can
+     *  actually act on; `inPerfectWindow` alone is only ever a confirmation. */
+    this.perfectCue = 0;
+    /** Quality01 the release would score right now, or -1 if outside the window. */
+    this.perfectQuality = -1;
+
+    /** Set by the game while OVERDRIVE is running. Hazards and lethal solid faces are
+     *  skipped entirely — DESIGN.md promises invulnerability and nothing implemented
+     *  it. Deflects still happen, so you still bounce off architecture. */
+    this.invuln = false;
+
     // ---- broad-phase candidate lists (preallocated) ------------------------
     this._solidIdx = new Int32Array(CAND_MAX); this._solidN = 0;
     this._hazIdx   = new Int32Array(CAND_MAX); this._hazN = 0;
     this._orbIdx   = new Int32Array(CAND_MAX); this._orbN = 0;
+    this._anchIdx  = new Int32Array(CAND_MAX); this._anchN = 0;
     this._solids = null; this._hazards = null; this._orbs = null; this._anchors = null;
     this._selCd = 0;                     // substeps until the next anchor re-test
     this._stallTime = 0;                 // s tethered below MIN_SPEED (drives the pump)
@@ -322,6 +365,8 @@ export class Player {
     this._accSteps = 0; this.time = 0; this.trailTimer = 0;
     this.perfectFlash = 0; this.attachFlash = 0;
     this.inPerfectWindow = false;
+    this.perfectETA = -1; this.perfectCue = 0; this.perfectQuality = -1;
+    this.invuln = false;
     this.input = false; this.inputPrev = false;
     this.distance = 0;
     this._selCd = 0;
@@ -396,7 +441,7 @@ export class Player {
       _wrapPi(this.angle - this.renderAngle), 26, dt);
 
     // Perfect-window telegraph: pure feedback, teaches L2 without a tutorial.
-    this.inPerfectWindow = this.tetherState === T_ATTACHED && this._perfectAngle() >= 0;
+    this._perfectTelegraph();
 
     this._grazeScan(world, events, dt);
     this._pushTrail(dt);
@@ -749,7 +794,14 @@ export class Player {
       const aboveOk = up >= upGate;
       const fwdOk   = ux >= -behindTol;
       const momOk   = radial <= veto;
-      const safeOk  = low < FLOODLINE || k > 0.45;
+      // THE BAILOUT. This gate vetoes exactly the anchors a sinking player needs —
+      // the low ones whose arc bottoms out under the water — and it used to hold
+      // until desperation cleared 0.45, which floodline proximity alone only reaches
+      // within 11.4m of the surface. At the measured 62 m/s descent that is 0.19s of
+      // runway: the escape hatch unlocked AFTER the crash was unavoidable. 0.18 opens
+      // it ~30m up (~0.5s), enough to fire the hook and load the rope. A wet swing
+      // you survive beats a dry one you never take.
+      const safeOk  = low < FLOODLINE || k > 0.18;
       const valid = inRange && inCone && aboveOk && fwdOk && momOk && safeOk;
 
       // ---- score ---------------------------------------------------------
@@ -824,6 +876,55 @@ export class Player {
   }
 
   /**
+   * PREDICTIVE perfect-arc telegraph. Runs once per frame, writes three signals the
+   * HUD and the renderer read: `perfectQuality`, `perfectETA`, `perfectCue`.
+   *
+   * Reading `inPerfectWindow` off the CURRENT velocity — which is all this used to do
+   * — produces a cue that switches on at the instant the window opens and off a
+   * median 0.22s later. Human visual reaction is ~250ms, so that cue is late BY
+   * CONSTRUCTION and the window can only be hit by rhythm or by luck. (A sim has zero
+   * latency, which is the only reason the SMART bot managed 27.5 hits/run.)
+   *
+   * The fix is that phi is EXTRAPOLATABLE. The rope bearing sweeps at a known rate,
+   * so we can say how many seconds remain before it crosses P_PHI_MAX and start the
+   * cue P_ETA_LEAD seconds early. This is the difference between "you missed it" and
+   * "here it comes".
+   */
+  _perfectTelegraph() {
+    const q = this.tetherState === T_ATTACHED ? this._perfectAngle() : -1;
+    this.perfectQuality = q;
+    this.inPerfectWindow = q >= 0;
+    if (this.inPerfectWindow) { this.perfectETA = 0; this.perfectCue = 1; return; }
+
+    this.perfectETA = -1;
+    this.perfectCue = 0;
+    if (this.tetherState !== T_ATTACHED) return;
+
+    // The window has a speed floor as well as an angle band, and only the angle is
+    // predictable. Suppress the cue when the swing is too slow to score — the pump
+    // is still adding energy, so allow a little headroom rather than flickering the
+    // cue on and off across the boundary.
+    if (this.speed < P_MIN_SPEED * 0.85) return;
+
+    const rdx = this.sx - this.anchorX, rdy = this.sy - this.anchorY;
+    const L2 = rdx * rdx + rdy * rdy;
+    if (L2 < 1e-6) return;
+
+    // omega = dphi/dt = vt / L. NEGATIVE on a forward swing (phi sweeps down from PI
+    // toward 0), which is the only direction that can reach the window from outside.
+    const omega = (this.vx * -rdy + this.vy * rdx) / L2;
+    if (omega > -1e-3) return;
+
+    const phi = Math.atan2(rdy, rdx);
+    if (phi <= P_PHI_MAX) return;         // window already open (handled above) or spent
+
+    const eta = (phi - P_PHI_MAX) / -omega;
+    if (eta > P_ETA_LEAD) return;         // real, but too far out to be worth signalling
+    this.perfectETA = eta;
+    this.perfectCue = 1 - eta / P_ETA_LEAD;
+  }
+
+  /**
    * Returns quality01 (1 = dead centre of the window) if the current velocity is
    * inside the Perfect Arc window, or -1 if it is not.
    * +Y IS DOWN: "up and forward" is vx > 0 AND vy < 0.
@@ -890,6 +991,21 @@ export class Player {
         this._orbIdx[this._orbN++] = i;
       }
     }
+
+    // Anchors are grazable geometry (see GRAZE_ANCHORS) but never collide, so they
+    // get their own narrow list — the graze band is the only thing that reads it.
+    this._anchN = 0;
+    const anchors = this._anchors;
+    if (GRAZE_ANCHORS && anchors) {
+      for (let i = 0; i < anchors.length && this._anchN < CAND_MAX; i++) {
+        const a = anchors[i];
+        if (!a || a.alive === false) continue;
+        const dx = a.x - x;
+        if (dx > win || dx < -win) continue;
+        if (a._grazeCd > 0) a._grazeCd -= dt; else a._grazeCd = 0;
+        this._anchIdx[this._anchN++] = i;
+      }
+    }
   }
 
   /** Hard contacts. Runs every substep so nothing tunnels. */
@@ -902,8 +1018,14 @@ export class Player {
     // ---- floodline --------------------------------------------------------
     if (y > FLOODLINE) { this._crash(events); return; }
 
-    // ---- hazards: always lethal ------------------------------------------
-    if (hazards) {
+    // ---- hazards: always lethal, unless OVERDRIVE is up -------------------
+    // DESIGN.md promises invulnerability during overdrive and nothing implemented it.
+    // The whole point of L5 ("bank charge, trigger it on a dense hazard cluster") is
+    // that the meter buys you a corridor you could not otherwise take, so this branch
+    // is the mechanic. The floodline above still kills — drowning is not a hazard,
+    // it is the edge of the world, and making it survivable would delete the failure
+    // state a held input can produce.
+    if (hazards && !this.invuln) {
       for (let k = 0; k < this._hazN; k++) {
         const o = hazards[this._hazIdx[k]];
         if (!o || o.alive === false) continue;
@@ -931,7 +1053,7 @@ export class Player {
         // The tutorial stretch is survivable BY CONSTRUCTION: for the first
         // SOLID_SAFE_DIST metres, architecture can only ever bounce you off it.
         // Hazards still kill — the player must still learn that magenta means death.
-        const lethalOk = this.distance >= SOLID_SAFE_DIST;
+        const lethalOk = this.distance >= SOLID_SAFE_DIST && !this.invuln;
         if (lethalOk && sinInc > DEFLECT_SIN) { this._crash(events); return; }
 
         // Glance: reflect the normal component with low restitution, scrub the
@@ -956,9 +1078,13 @@ export class Player {
         }
         this.vx = rx; this.vy = ry;
 
+        // A deflect is a HIT — you touched the wall. It used to fire `graze`, so
+        // bumping into architecture scored and charged identically to threading past
+        // it: the L3 skill layer paying out for the exact opposite of the skill.
+        // It gets its own event, and no score.
         if (!(o._grazeCd > 0)) {
           o._grazeCd = DEFLECT_CD;
-          if (events && events.graze) events.graze(this.sx, this.sy, o);
+          if (events && events.deflect) events.deflect(this.sx, this.sy, o);
         }
       }
     }
@@ -979,7 +1105,14 @@ export class Player {
     }
   }
 
-  /** Near-misses. Once per frame is plenty — it is cooldown-gated anyway. */
+  /**
+   * Near-misses. Once per frame is plenty — it is cooldown-gated anyway.
+   *
+   * The fourth argument tells the sink whether the thing skimmed was a LIVE HAZARD.
+   * That is the only graze that could have killed you, so it is the only one worth
+   * real money (SCORE_GRAZE_HAZARD / GRAZE_CHARGE_HAZARD): risk = reward, per
+   * DESIGN.md L3. Architecture and anchors pay the base rate.
+   */
   _grazeScan(world, events, dt) {
     if (!events || !events.graze) return;
     const x = this.sx, y = this.sy;
@@ -993,7 +1126,7 @@ export class Player {
         obbProbe(x, y, o.x, o.y, o.hw, o.hh, o.rot || 0);
         if (_sd >= RADIUS && _sd < outer && !(o._grazeCd > 0)) {
           o._grazeCd = GRAZE_COOLDOWN;
-          events.graze(x, y, o);
+          events.graze(x, y, o, true);
         }
       }
     }
@@ -1006,7 +1139,26 @@ export class Player {
         obbProbe(x, y, o.x, o.y, o.hw, o.hh, o.rot || 0);
         if (_sd >= RADIUS && _sd < outer && !(o._grazeCd > 0)) {
           o._grazeCd = GRAZE_COOLDOWN;
-          events.graze(x, y, o);
+          events.graze(x, y, o, false);
+        }
+      }
+    }
+
+    // Anchors. Circles, not boxes, and never solid — so the band is measured off the
+    // ring surface and a dead-centre fly-through scores nothing. Threading the edge
+    // of a node you chose not to take is the graze; taking it is not.
+    const anchors = this._anchors;
+    if (GRAZE_ANCHORS && anchors) {
+      const skipA = this.anchor, skipB = this._recentAnchor;
+      for (let k = 0; k < this._anchN; k++) {
+        const a = anchors[this._anchIdx[k]];
+        if (!a || a.alive === false || a === skipA || a === skipB) continue;
+        if (a._grazeCd > 0) continue;
+        const dx = x - a.x, dy = y - a.y;
+        const sd = Math.sqrt(dx * dx + dy * dy) - a.r;
+        if (sd >= RADIUS && sd < outer) {
+          a._grazeCd = GRAZE_COOLDOWN;
+          events.graze(x, y, a, false);
         }
       }
     }
@@ -1147,8 +1299,13 @@ export class Player {
     const perp = this.inPerfectWindow ? 1 : 0;
 
     // Speed halo.
-    tint(CA, PAL.cyanHot, 0.28 + s01 * 0.85, 1);
-    r.glow(LAYER.NEON, x, y, 2.4 + s01 * 4.2, CA, { glow: 1.35, glowRadius: 3.0 + s01 * 4 });
+    // The halo used to peak at 6.6 world units against a 1.02-unit body ring — 6.5x
+    // the character — emitting 3.4x over the bright-pass threshold across the whole
+    // disc. That clipped to a flat cyan plateau ~29% of the frame wide with no
+    // internal structure, burying the directional wings, outer ring and white-hot
+    // core drawn below it. Kept under the threshold so it blooms without plateauing.
+    tint(CA, PAL.cyanHot, 0.14 + s01 * 0.30, 1);
+    r.glow(LAYER.NEON, x, y, 1.5 + s01 * 1.5, CA, { glow: 0.9, glowRadius: 1.6 + s01 * 1.4 });
 
     // Directional wings — heading must be readable in a single glance.
     const wingRot = a - HALF_PI;
@@ -1165,6 +1322,19 @@ export class Player {
     r.ring(LAYER.NEON, x, y, 1.02, 0.15, CA, { glow: 1.9, glowRadius: 1.1, soft: 0.045 });
     tint(CB, PAL.white, 1.5 + s01 * 1.4, 1);
     r.circle(LAYER.NEON, x, y, 0.52, CB, { glow: 2.6, glowRadius: 1.5, soft: 0.04 });
+
+    // ---- PREDICTIVE perfect-arc cue ---------------------------------------
+    // A collapsing amber ring that starts P_ETA_LEAD seconds BEFORE the window opens
+    // and lands on the body exactly as it does. `inPerfectWindow` above is only ever
+    // confirmation — this is the part a human can actually act on, because it gives
+    // back the ~250ms of reaction time the old instantaneous cue never had. The
+    // collapse is the read: "let go when the ring touches you."
+    if (this.perfectCue > 0 && !perp) {
+      const c = this.perfectCue;
+      tint(CC, PAL.amberHot, 0.30 + 1.30 * c * c, 1);
+      r.ring(LAYER.FOREGROUND, x, y, 1.15 + (1 - c) * 5.2, 0.06 + 0.10 * c, CC,
+        { glow: 1.2 + c * 1.4, glowRadius: 1.0, soft: 0.06 });
+    }
 
     // Perfect-arc burst.
     if (this.perfectFlash > 0) {

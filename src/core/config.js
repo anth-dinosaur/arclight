@@ -9,15 +9,27 @@ export const CFG = {
   VIEW_WIDTH: 46,          // world units visible horizontally; drives zoom
   MAX_DPR: 2.0,
   CAMERA_FOLLOW: 7.0,      // damping rate, higher = stiffer
-  CAMERA_LOOKAHEAD: 0.38,  // seconds of velocity to lead by
-  CAMERA_LOOKAHEAD_MAX: 16,
+  // Seconds of velocity to lead by, and the hard cap on that lead.
+  // Load-bearing for whether SKILL PAYS. Difficulty is distance-driven, so flying
+  // fast reaches every hazard band sooner in wall-clock while shrinking the reaction
+  // window — speed was taxed twice and subsidised never. The old clamp saturated at
+  // vx 42 (16 / 0.38), which is below cruise (~55 m/s), so above that going faster
+  // bought literally ZERO extra vision. 34 / 0.46 keeps the lead growing to vx 74,
+  // past anything the pump can reach, so seeing further is the reward for speed.
+  CAMERA_LOOKAHEAD: 0.46,
+  CAMERA_LOOKAHEAD_MAX: 34,
   CAMERA_ROLL: 0.055,      // radians of roll per unit of normalised lateral velocity
   CAMERA_Y_BIAS: -3.5,     // sit the player slightly below centre
 
   // ---- physics ------------------------------------------------------------
   GRAVITY: 62,
   AIR_DRAG: 0.055,         // per second, applied to speed
-  TERMINAL_SPEED: 120,
+  // The swing plateau is set by TETHER_MAX_OMEGA * L_median (3.2 * 17 ~= 54 m/s), so
+  // 99.2% of frames land under 80 m/s. At 120 the quadratic drag term and the
+  // OVERSPEED brake were unreachable dead code and speed01 never left the bottom
+  // half of its range. 92 sits just above the fastest measured frame (max ~82), so
+  // the brake finally shapes the top end instead of guarding a ceiling nobody hits.
+  TERMINAL_SPEED: 92,
   PLAYER_RADIUS: 0.85,     // collision; deliberately smaller than the sprite
   MIN_SPEED: 9,            // gentle forward assist so a stalled player recovers
 
@@ -47,10 +59,13 @@ export const CFG = {
   // Auto-hop. Pumping alone makes the player orbit one anchor forever and travel
   // nowhere. Once the rope bearing falls below this the forward arc is spent and
   // holding on would drag them backwards, so release and let the assist grab the next
-  // anchor. Deliberately set OUTSIDE the perfect-arc window (0.61–1.31) so holding
-  // travels but deliberate release still owns the skill ceiling — measured, at 0.70
-  // the hold bot scored 21.5 perfect arcs/run and collapsed that distinction.
-  TETHER_AUTO_HOP_PHI: 0.45,
+  // anchor. Deliberately set OUTSIDE the perfect-arc window so holding travels but
+  // deliberate release still owns the skill ceiling — measured, at 0.70 the hold bot
+  // scored 21.5 perfect arcs/run and collapsed that distinction. Widening the window
+  // to phi 0.44–1.37 swallowed the old 0.45, which would have handed every held swing
+  // a (zero-quality) free arc plus its impulse; 0.38 puts the hop back underneath it,
+  // so a held player sweeps THROUGH the window and out the far side without scoring.
+  TETHER_AUTO_HOP_PHI: 0.38,
   TETHER_AUTO_HOP_MIN_TIME: 0.15,
   TETHER_AUTO_HOP_LOCKOUT: 0.7,   // stops ping-ponging back to the anchor just left
 
@@ -60,18 +75,43 @@ export const CFG = {
   TETHER_REEL_SPIN: 0.8,       // exponent on the (L_prev/L) angular-momentum term
   TETHER_W_RECENT: 2.5,
   SOLID_ESCAPE_SPEED: 9.0,
+  /** Metres above the floodline at which the targeting assist starts to panic.
+   *  At 26 the panic term only reached the bailout threshold within 11.4m of the
+   *  water — 0.19s of runway at the measured 62 m/s descent, i.e. after the crash
+   *  was already unavoidable. 44 opens it ~30m up, ~0.5s: enough to fire the hook
+   *  AND load the rope. */
+  TETHER_FLOOD_PANIC: 44,
 
   // ---- perfect arc --------------------------------------------------------
-  PERFECT_ANGLE_MIN: 0.26,  // 15°
-  PERFECT_ANGLE_MAX: 0.96,  // 55°
+  // While attached and taut the velocity heading is exactly (PI/2 - phi), where phi
+  // is the rope bearing, so this angle window IS a phi window: 0.44-1.37 rad. It was
+  // 0.61-1.31, open a median 0.22s (p10 0.08s) — shorter than human reaction time,
+  // so the window could only ever be hit by luck or by muscle-memory rhythm. Widened
+  // to ~0.93 rad it stays open ~0.29s AND, with the predictive cue in player.js
+  // (perfectETA/perfectCue), gets 0.35s of lead. Auto-hop at phi 0.45 still sits
+  // (just) outside the window, so "hold" never scores an arc and L1/L2 stay distinct.
+  PERFECT_ANGLE_MIN: 0.20,  // 11.5°
+  PERFECT_ANGLE_MAX: 1.13,  // 65°
   PERFECT_MIN_SPEED: 26,
   PERFECT_IMPULSE: 9,
-  PERFECT_CHARGE: 0.14,
+  /** Seconds of lead time on the predictive perfect-arc cue. Human visual reaction is
+   *  ~250ms; anything under that is a cue that is late BY CONSTRUCTION. */
+  PERFECT_ETA_LEAD: 0.35,
+  // Charge income. Overdrive was ON 45% of the run (2.1 triggers, 10.6s active per
+  // 23.4s) — the default state, not an event. Rebudgeted so a full meter is roughly
+  // 20 well-flown arcs' worth of income rather than 7, and so grazing a HAZARD (the
+  // risky version) is worth ~6 safe grazes.
+  // Measured: the whole economy accrues ~0.028 charge/s, so the meter took ~36s to
+  // fill against a 35.7s median run — overdrive filled exactly as you died and was
+  // effectively unreachable. Scaled 1.6x to fill in ~22s: one overdrive in a good
+  // run with time left to spend it, two in a great one.
+  PERFECT_CHARGE: 0.032,
 
   // ---- grazing ------------------------------------------------------------
   GRAZE_RADIUS: 3.4,
   GRAZE_COOLDOWN: 0.9,      // per object
-  GRAZE_CHARGE: 0.055,
+  GRAZE_CHARGE: 0.013,
+  GRAZE_CHARGE_HAZARD: 0.08,
 
   // ---- overdrive ----------------------------------------------------------
   OVERDRIVE_DURATION: 6.0,
@@ -80,11 +120,20 @@ export const CFG = {
   OVERDRIVE_REFUND: 0.25,
 
   // ---- combo / score ------------------------------------------------------
-  COMBO_WINDOW: 4.0,
-  COMBO_PER_STEP: 3,
-  COMBO_MAX_MULT: 10,
+  // The multiplier was a formality: at 1.9 combo events/s against a 4.0s window the
+  // decay could never fire, so ×10 was reached in ~10s and held for 33% of all
+  // frames. 2.2s is under the widest observed gap between events, 5 steps makes the
+  // climb cost something, and 12 gives the ceiling somewhere to go. The decay must
+  // step DOWN one level per window (main.js) rather than resetting to ×1 — that is
+  // what turns a long flat L4 flight into a priceable risk instead of a wipe.
+  COMBO_WINDOW: 2.2,
+  COMBO_PER_STEP: 5,
+  COMBO_MAX_MULT: 12,
   SCORE_PERFECT: 250,
   SCORE_GRAZE: 40,
+  /** Grazing a live hazard is the only graze that can kill you. Risk = reward, so it
+   *  pays 4.5x what skimming architecture does. */
+  SCORE_GRAZE_HAZARD: 180,
   SCORE_ORB: 100,
   SCORE_DIST_RATE: 0.1,
 
@@ -112,7 +161,10 @@ export const CFG = {
   CHUNKS_AHEAD: 5,
   CHUNKS_BEHIND: 2,
   FLOODLINE: 46,            // +Y is down; falling past this kills
-  TUTORIAL_DIST: 400,
+  // DESIGN.md L1 promises "you cannot fail in the first ~15 seconds". At the measured
+  // 46 world-u/s cruise, 400 expired at 8.7s and a rhythm player died inside 15s in
+  // 27% of runs. 800 world-units == ~17s of grace, which is the promise.
+  TUTORIAL_DIST: 800,
 
   // ---- collision forgiveness ----------------------------------------------
   // Measured from the surface TANGENT: a hit shallower than this deflects instead
@@ -121,11 +173,15 @@ export const CFG = {
   DEFLECT_RESTITUTION: 0.35,
   DEFLECT_SCRUB: 0.9,
   DEFLECT_COOLDOWN: 0.18,
-  /** Below this distance solids never kill, only deflect. Protects the tutorial. */
-  SOLID_SAFE_DIST: 400,
+  /** Below this distance solids never kill, only deflect. Protects the tutorial, so
+   *  it must track TUTORIAL_DIST exactly — at 400 the architecture started killing
+   *  at the same instant the tutorial ended, 8.7s into the run. */
+  SOLID_SAFE_DIST: 800,
 
   // ---- feel ---------------------------------------------------------------
-  HITSTOP_PERFECT: 0.045,
+  // 45ms fired 1.5x/second is 5.0% of wall clock spent frozen; it read as dropped
+  // frames, not as punch. 22ms is one 60Hz frame of hold — felt, not seen.
+  HITSTOP_PERFECT: 0.022,
   HITSTOP_CRASH: 0.22,
   TRAUMA_PERFECT: 0.22,
   TRAUMA_GRAZE: 0.10,

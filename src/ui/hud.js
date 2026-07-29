@@ -3,9 +3,16 @@
 // Contract (CONTRACTS.md):
 //   new Hud(root)                          root = <div id="hud">
 //   update(state)                          { distance, score, multiplier, charge01,
-//                                            overdrive01, alive, speed01 }
+//                                            overdrive01, alive, speed01,
+//                                            menu, holding }
 //   popup(kind, text, screenX, screenY)    kind: 'perfect'|'graze'|'orb'|'combo'
 //   reset()
+//
+// `menu` and `holding` are additive, optional fields. `menu` true hides the whole
+// HUD so it never ghosts through the title / game-over screens (the run's numbers
+// belong to RUN REPORT there, and printing them twice at two different values is
+// worse than not printing them at all). `holding` is the raw input-down flag and
+// only drives the first-run HOLD prompt.
 //
 // Design constraints this file takes seriously:
 //   * update() runs 60–120×/s. Every channel is cached and quantised; the
@@ -19,27 +26,47 @@
 
 const POOL_SIZE = 24;
 
+/** localStorage key: has the player ever held the screen? Gates the HOLD prompt. */
+const LS_TAUGHT = 'arclight.taught';
+
+/** Backstop for the HOLD prompt, in metres. The prompt is meant to clear on the
+ *  first touch-down (`state.holding`); this is the safety net for a caller that
+ *  does not pass the flag, so the worst case is "clears a bit late" rather than
+ *  "burns in over the whole run". Deliberately well inside the 400m tutorial
+ *  zone but far enough out that a genuinely idle player still gets to read it. */
+const TEACH_MAX_M = 120;
+
 /** Colour ramp for the multiplier badge, indexed by integer multiplier.
- *  cyan → violet → magenta → amber at ×10. Constant strings, so assigning one
- *  allocates nothing. Index 0 is unused (multiplier starts at 1). */
+ *  cyan → violet → amber. Deliberately NEVER magenta: #ff2d95 is the hazard hue
+ *  (DESIGN.md) and main.js paints a full-screen magenta damage vignette near the
+ *  floodline — a magenta badge is unreadable exactly when it matters most.
+ *  Constant strings, so assigning one allocates nothing. Index 0 is unused. */
 const MULT_COLORS = [
   '#22f0ff', // 0 (unused)
   '#22f0ff', // ×1
-  '#4fdcff', // ×2
-  '#7ec4ff', // ×3
-  '#8b5cf6', // ×4
-  '#a855f0', // ×5
-  '#d946c8', // ×6
-  '#ff2d95', // ×7
-  '#ff5f6e', // ×8
-  '#ff8a3d', // ×9
-  '#ffb020', // ×10
+  '#22f0ff', // ×2
+  '#5fe6ff', // ×3
+  '#8fd8ff', // ×4
+  '#a78bfa', // ×5
+  '#8b5cf6', // ×6
+  '#a855f0', // ×7
+  '#c084fc', // ×8
+  '#ffd166', // ×9
+  '#ffc14d', // ×10
+  '#ffb020', // ×11
 ];
+/** Last valid ramp index. The ramp is allowed to be SHORTER than the label table:
+ *  CFG.COMBO_MAX_MULT is tuned by another owner and has already moved 10 → 12, so
+ *  anything past the end simply holds the top colour rather than reading undefined. */
+const MULT_COL_TOP = MULT_COLORS.length - 1;
 
-/** Pre-rendered "×N" labels. Avoids string concat in the changed path too. */
+/** Pre-rendered "×N" labels. Avoids string concat in the changed path too.
+ *  Runs well past CFG.COMBO_MAX_MULT so a tuning change can never print "undefined". */
 const MULT_LABELS = [
-  '', '×1', '×2', '×3', '×4', '×5', '×6', '×7', '×8', '×9', '×10',
+  '', '×1', '×2', '×3', '×4', '×5', '×6', '×7', '×8',
+  '×9', '×10', '×11', '×12', '×13', '×14', '×15', '×16',
 ];
+const MULT_TOP = MULT_LABELS.length - 1;
 
 /** Circumference of the overdrive ring (r = 24). Must match ui.css. */
 const OD_CIRCUMFERENCE = 150.796;
@@ -68,7 +95,8 @@ export class Hud {
     //      │   ├ .hud-score  → label + value
     //      │   └ .hud-mult                appears only when multiplier > 1
     //      ├ .hud-od         → svg ring + label            (overdrive countdown)
-    //      ├ .hud-charge     → track/ticks/fill + label    (right edge)
+    //      ├ .hud-charge     → label + track/ticks/fill    (right edge)
+    //      ├ .hud-teach      → .hud-teach-i "HOLD"         (first run only)
     //      └ .hud-pops       → 24 × .pop → .pop-i          (pooled)
     const el = this.el = document.createElement('div');
     el.className = 'hud-root';
@@ -92,7 +120,10 @@ export class Hud {
     score.appendChild(div('hud-score-label', 'SCORE'));
     score.appendChild(this.scoreEl = div('hud-score-val', '0'));
     top.appendChild(score);
-    top.appendChild(this.multEl = div('hud-mult', '×2'));
+    // Seeded EMPTY, not '×2'. The badge is invisible until the multiplier passes
+    // ×1, but seeded text is still what a screen reader announces and what any
+    // DOM probe reports as the title screen's content.
+    top.appendChild(this.multEl = div('hud-mult', ''));
     el.appendChild(top);
 
     // Overdrive countdown ring. SVG so the drain is a stroke-dashoffset write,
@@ -108,13 +139,22 @@ export class Hud {
     od.appendChild(div('hud-od-label', 'O/D'));
     el.appendChild(this.odEl = od);
 
+    // Charge meter. Label goes FIRST — set horizontally above the track, not
+    // rotated beside it. A vertical label read top-to-bottom against a meter that
+    // fills bottom-to-top is two opposing reading directions on one element.
     const charge = div('hud-charge');
+    charge.appendChild(div('hud-charge-label', 'CHARGE'));
     const track = div('hud-charge-track');
     track.appendChild(this.chargeFill = div('hud-charge-fill'));
     track.appendChild(div('hud-charge-ticks'));
     charge.appendChild(track);
-    charge.appendChild(div('hud-charge-label', 'CHARGE'));
     el.appendChild(charge);
+
+    // First-run prompt. The entire control scheme is one verb, and nothing on
+    // screen says it. Shown until the player's first touch-down, ever.
+    const teach = div('hud-teach');
+    teach.appendChild(div('hud-teach-i', 'HOLD'));
+    el.appendChild(this.teachEl = teach);
 
     el.appendChild(this.pops = div('hud-pops'));
     root.appendChild(el);
@@ -167,6 +207,12 @@ export class Hud {
     this._fast = false;
     this._shown = false;
     this._multFlip = 0;
+    this._breakFlip = 0;
+
+    // Teaching prompt. `_taught` is sticky across sessions; `_teachOn` is the
+    // per-run live flag.
+    this._taught = readFlag(LS_TAUGHT);
+    this._teachOn = false;
 
     this.reset();
   }
@@ -174,14 +220,29 @@ export class Hud {
   // ---------------------------------------------------------------- update --
   /**
    * @param {{distance:number,score:number,multiplier:number,charge01:number,
-   *          overdrive01:number,alive:boolean,speed01:number}} s
+   *          overdrive01:number,alive:boolean,speed01:number,
+   *          menu?:boolean,holding?:boolean}} s
    * Hot path. Every branch below early-outs on an unchanged quantised value, so
    * a steady frame costs a handful of integer compares and nothing else.
    */
   update(s) {
-    if (!this._shown) {
-      this._shown = true;
-      this.el.classList.add('is-on');
+    // --- visibility -------------------------------------------------------
+    // Gated per-frame on `menu`, not latched once. The old one-shot latch meant
+    // the HUD was painted over the title screen on the very first frame anyone
+    // sees, and printed the run's numbers a second time — at a different value —
+    // over the game-over count-up.
+    const on = !s.menu;
+    if (on !== this._shown) {
+      this._shown = on;
+      this.el.classList.toggle('is-on', on);
+    }
+
+    // --- first-run prompt: dismissed by the first touch-down, forever ------
+    if (this._teachOn && (s.holding || s.distance > TEACH_MAX_M)) {
+      this._teachOn = false;
+      this._taught = true;
+      writeFlag(LS_TAUGHT);
+      this.el.classList.add('teach-out');
     }
 
     // --- distance: the headline. Whole metres only. -----------------------
@@ -201,14 +262,15 @@ export class Hud {
     // --- multiplier: badge only exists above ×1 ---------------------------
     let m = s.multiplier | 0;
     if (m < 1) m = 1;
-    if (m > 10) m = 10;
+    if (m > MULT_TOP) m = MULT_TOP;
     if (m !== this._mult) {
       const prev = this._mult;
       this._mult = m;
       const mEl = this.multEl;
       if (m > 1) {
         mEl.textContent = MULT_LABELS[m];
-        mEl.style.setProperty('--mult-col', MULT_COLORS[m]);
+        mEl.style.setProperty('--mult-col', MULT_COLORS[m > MULT_COL_TOP ? MULT_COL_TOP : m]);
+        mEl.classList.remove('break-a', 'break-b');
         if (prev <= 1) mEl.classList.add('is-on');
         if (m > prev) {
           // Restart the spring by swapping between two identical keyframe
@@ -218,7 +280,17 @@ export class Hud {
           this._multFlip ^= 1;
         }
       } else {
-        mEl.classList.remove('is-on', 'spring-a', 'spring-b');
+        mEl.classList.remove('spring-a', 'spring-b');
+        if (prev > 1) {
+          // COMBO BREAK. Losing a ×10 is a bigger event than earning a ×2 and it
+          // used to happen in zero channels — the badge just evaporated on a
+          // 160ms opacity transition. Flash it dead and collapse it. Same
+          // two-track trick as the spring so a repeat break restarts cleanly.
+          if (this._breakFlip) { mEl.classList.remove('break-b'); mEl.classList.add('break-a'); }
+          else                 { mEl.classList.remove('break-a'); mEl.classList.add('break-b'); }
+          this._breakFlip ^= 1;
+        }
+        mEl.classList.remove('is-on');
       }
     }
 
@@ -348,9 +420,14 @@ export class Hud {
     this._freeTop = POOL_SIZE;
     this._seqNext = 1;
 
-    this.el.classList.remove('is-od', 'is-full', 'is-dead', 'is-fast');
-    this.multEl.classList.remove('is-on', 'spring-a', 'spring-b');
+    this.el.classList.remove('is-od', 'is-full', 'is-dead', 'is-fast', 'teach-out');
+    this.multEl.classList.remove('is-on', 'spring-a', 'spring-b', 'break-a', 'break-b');
     this.chargeFill.style.transform = 'scale3d(1,0,1)';
+
+    // The HOLD prompt is armed for every run until the player's first touch-down
+    // ever, then never again on this device.
+    this._teachOn = !this._taught;
+    this.el.classList.toggle('is-teach', this._teachOn);
     this.odArc.style.strokeDashoffset = OD_CIRCUMFERENCE;
     this.distEl.textContent = '0';
     this.scoreEl.textContent = '0';
@@ -366,11 +443,23 @@ export class Hud {
     this._fast = false;
   }
 
-  /** Fade the whole HUD out (used by the integrator on menus, if wanted). */
+  /** Fade the whole HUD out. update() drives this from `state.menu`; the method
+   *  stays for anything that needs to force it out of band. */
   setVisible(v) {
     this._shown = !!v;
     this.el.classList.toggle('is-on', !!v);
   }
+}
+
+/* ---------------------------------------------------------- persistence --- */
+/* Private browsing throws on localStorage access, so both are try-wrapped and
+   the prompt degrades to "shows every run" rather than to a crash. */
+
+function readFlag(k) {
+  try { return localStorage.getItem(k) === '1'; } catch (_) { return false; }
+}
+function writeFlag(k) {
+  try { localStorage.setItem(k, '1'); } catch (_) { /* private mode */ }
 }
 
 /* -------------------------------------------------------------- helpers --- */

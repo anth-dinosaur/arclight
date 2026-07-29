@@ -11,6 +11,15 @@ const ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = process.env.HOST || '0.0.0.0';
 
+// `no-store` on everything was simple but wrong once there is a service worker:
+// it is the one directive that forbids storing a response at all, which is
+// hostile to the offline shell and pointless for assets that never change
+// during a session. `no-cache` still forces a revalidation on every request —
+// so edits show up on the next reload exactly as before — while letting the
+// browser and the SW keep a copy.
+const CACHE_IMMUTABLE = 'public, max-age=3600';
+const CACHE_REVALIDATE = 'no-cache';
+
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -38,14 +47,23 @@ const server = createServer(async (req, res) => {
     const info = await stat(target);
     if (info.isDirectory()) { res.writeHead(404).end('Not found'); return; }
 
+    const ext = extname(target).toLowerCase();
     const body = await readFile(target);
-    res.writeHead(200, {
-      'Content-Type': TYPES[extname(target).toLowerCase()] || 'application/octet-stream',
+    const headers = {
+      'Content-Type': TYPES[ext] || 'application/octet-stream',
       'Content-Length': body.length,
-      // The game is edited constantly during development; never let Safari cache it.
-      'Cache-Control': 'no-store, must-revalidate',
+      // Icons are the only thing here that is not edited during development.
+      'Cache-Control': (ext === '.png' || ext === '.svg' || ext === '.ico')
+        ? CACHE_IMMUTABLE
+        : CACHE_REVALIDATE,
       'Cross-Origin-Opener-Policy': 'same-origin',
-    });
+    };
+    // A stale service worker outlives a reload; it must never be served from cache.
+    if (path.endsWith('/sw.js')) {
+      headers['Cache-Control'] = 'no-cache';
+      headers['Service-Worker-Allowed'] = '/';
+    }
+    res.writeHead(200, headers);
     res.end(req.method === 'HEAD' ? undefined : body);
   } catch (err) {
     if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {

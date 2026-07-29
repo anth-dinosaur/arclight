@@ -14,7 +14,7 @@ Then open the printed `network` URL on your phone. Add to Home Screen for fullsc
 
 **Hold anywhere.** A light-tether fires at the best anchor ahead and you swing.
 **Let go.** You keep every bit of the momentum you built.
-**Let go while climbing** (15°–55° above horizontal) for a **PERFECT ARC** — bonus score,
+**Let go while climbing** (11°–65° above horizontal) for a **PERFECT ARC** — bonus score,
 a forward impulse, and a combo step.
 
 That is the entire control scheme: one finger, down and up. Nothing else.

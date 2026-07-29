@@ -13,7 +13,7 @@ everything. The city is black glass and screaming neon.
 3. Swing. While held, the tether **auto-reels** slightly — this pumps energy in, like
    kicking on a playground swing. Hold longer through the arc = more speed.
 4. **RELEASE** → detach, momentum is conserved exactly. Release angle decides your
-   trajectory. Releasing in the "power window" (moving up-forward, 15°–55° above
+   trajectory. Releasing in the "power window" (moving up-forward, 11°–65° above
    horizontal) scores **PERFECT ARC**: bonus + a small forward impulse + a flash.
 5. Repeat. Chain perfect arcs to build a combo multiplier.
 

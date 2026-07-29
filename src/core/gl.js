@@ -13,15 +13,66 @@ export function createContext(canvas) {
   });
   if (!gl) return null;
 
-  // Half-float render targets are the whole point (HDR > 1.0 drives bloom).
-  // EXT_color_buffer_float covers RGBA16F on iOS; half_float is the narrower fallback.
+  return { gl, hdr: queryExtensions(gl) };
+}
+
+/**
+ * Half-float render targets are the whole point (HDR > 1.0 drives bloom).
+ * EXT_color_buffer_float covers RGBA16F on iOS; half_float is the narrower
+ * fallback. Extension objects do not survive a context loss, so this is split
+ * out and re-run from the restore path.
+ */
+export function queryExtensions(gl) {
   const ext =
     gl.getExtension('EXT_color_buffer_half_float') ||
     gl.getExtension('EXT_color_buffer_float');
   gl.getExtension('OES_texture_float_linear');   // optional: linear filtering on float
-  const hdr = !!ext;
+  return !!ext;
+}
 
-  return { gl, hdr };
+/**
+ * Context-loss plumbing. iOS Safari drops WebGL contexts routinely — lock
+ * screen, backgrounding, memory pressure — and WebKit will NEVER fire
+ * `webglcontextrestored` unless the page calls `preventDefault()` on the loss
+ * event. Without this the render loop keeps running against a dead context and
+ * produces a frozen black screen under a live HUD, with zero console output.
+ *
+ * The caller owns the rebuild: every program, buffer, texture and VAO created
+ * before the loss is gone, so `onRestore` must recreate all of them, and the
+ * loop must not draw while `state.lost` is true.
+ */
+export function installContextLoss(canvas, { onLost, onRestore } = {}) {
+  const state = {
+    lost: false,
+    losses: 0,
+    restores: 0,
+    dispose() {
+      canvas.removeEventListener('webglcontextlost', handleLost, false);
+      canvas.removeEventListener('webglcontextrestored', handleRestored, false);
+    },
+  };
+
+  function handleLost(e) {
+    // Mandatory. Skip it and WebKit treats the context as permanently dead.
+    if (e && e.preventDefault) e.preventDefault();
+    state.lost = true;
+    state.losses++;
+    if (onLost) { try { onLost(); } catch (err) { console.error(err); } }
+  }
+
+  function handleRestored() {
+    state.restores++;
+    if (onRestore) {
+      // A throw mid-rebuild leaves half a graph; stay parked rather than draw
+      // through it. The next restore event gets another go.
+      try { onRestore(); } catch (err) { console.error(err); return; }
+    }
+    state.lost = false;
+  }
+
+  canvas.addEventListener('webglcontextlost', handleLost, false);
+  canvas.addEventListener('webglcontextrestored', handleRestored, false);
+  return state;
 }
 
 export function compileShader(gl, type, src, label) {

@@ -70,30 +70,45 @@ const NOMINAL_CAM_Y = 8;
 const HORIZON_FRAC = 0.34;
 const SKY_PARALLAX = 0.02;
 
-const BAND_COUNT = 5;
-//                                        far ────────────────────────────► near
-const BAND_PARALLAX = Float32Array.of(0.06, 0.12, 0.21, 0.35, 0.55);
-const BAND_COLW     = Float32Array.of(3.40, 4.40, 6.00, 8.50, 13.00);
+/**
+ * SIX bands, not five. The fifth used to top out at parallax 0.55 while gameplay
+ * runs at 1.0 and the foreground streak band at 1.30 — a 0.55–1.30 hole with nothing
+ * in it, so the whole skyline moved as one mass and the lower third of the frame was
+ * chronically dead. Band 5 sits at 0.78: wide columns, sparse fill, almost no fog,
+ * and a base line far enough below the horizon to actually occupy that dead space.
+ */
+const BAND_COUNT = 6;
+//                                        far ──────────────────────────────────► near
+const BAND_PARALLAX = Float32Array.of(0.06, 0.12, 0.21, 0.35, 0.55, 0.78);
+const BAND_COLW     = Float32Array.of(3.40, 4.40, 6.00, 8.50, 13.00, 18.00);
 /** Probability a column actually contains a tower (gaps read as streets/canyons). */
-const BAND_FILL     = Float32Array.of(0.94, 0.88, 0.80, 0.68, 0.55);
+const BAND_FILL     = Float32Array.of(0.94, 0.88, 0.80, 0.68, 0.55, 0.42);
 /** Aerial perspective: 0 = full contrast near, 1 = dissolved into the fog colour. */
-const BAND_FOG      = Float32Array.of(0.90, 0.74, 0.55, 0.33, 0.13);
+const BAND_FOG      = Float32Array.of(0.90, 0.74, 0.55, 0.33, 0.13, 0.06);
 /** Silhouette alpha. Near-opaque throughout: city light is drawn ON the facade
  *  (SOLID, after the silhouette), not behind it, so structure no longer has to be
  *  translucent to be lit. Only the two furthest bands keep a little transparency,
  *  purely so they dissolve into the horizon glow. */
-const BAND_ALPHA    = Float32Array.of(0.86, 0.92, 0.97, 1.00, 1.00);
+const BAND_ALPHA    = Float32Array.of(0.86, 0.92, 0.97, 1.00, 1.00, 1.00);
 /** Base line drop below the horizon, × halfH. Nearer bands sit lower — the city
- *  steps down toward the viewer, which is the strongest single depth cue we have. */
-const BAND_BASE     = Float32Array.of(0.00, 0.03, 0.07, 0.13, 0.22);
+ *  steps down toward the viewer, which is the strongest single depth cue we have.
+ *  The near end is pushed well past the old 0.22 so the bottom third of a portrait
+ *  frame contains skyline instead of empty murk. */
+const BAND_BASE     = Float32Array.of(0.00, 0.03, 0.07, 0.14, 0.24, 0.34);
 /** Tower height range as a fraction of halfH (biased short by a squared roll). */
-const BAND_H_MIN    = Float32Array.of(0.045, 0.065, 0.090, 0.110, 0.100);
-const BAND_H_MAX    = Float32Array.of(0.300, 0.460, 0.640, 0.860, 1.050);
+const BAND_H_MIN    = Float32Array.of(0.045, 0.065, 0.090, 0.110, 0.100, 0.090);
+const BAND_H_MAX    = Float32Array.of(0.300, 0.460, 0.640, 0.860, 1.050, 1.200);
 /** Lit windows drawn as individual primitives per tower. Far bands get zero and
- *  rely on soft blobs instead — a 3px window at p=0.06 is a waste of a primitive. */
-const BAND_WINDOWS  = Int32Array.of(0, 0, 4, 8, 12);
-/** Soft "implied window" blobs per tower. */
-const BAND_BLOBS    = Int32Array.of(1, 1, 1, 1, 2);
+ *  rely on soft blobs instead — a 3px window at p=0.06 is a waste of a primitive.
+ *  Band 5 gets FEWER than band 4 even though it is nearer: at parallax 0.78 each
+ *  window is a large bright chip, and 14 of them per tower read as confetti scattered
+ *  over the lower third rather than as a facade. */
+const BAND_WINDOWS  = Int32Array.of(0, 0, 4, 8, 12, 9);
+/** Soft "implied window" blobs per tower. Band 5 gets one, not two: its columns are
+ *  18 units wide, so each blob is an ellipse ~10 x 26 units — two of them per tower
+ *  covered the whole lower frame in a flat teal wash and cost ~6 points of true black
+ *  for no additional information. */
+const BAND_BLOBS    = Int32Array.of(1, 1, 1, 1, 2, 1);
 /**
  * Emissive gain per band. City light lands on LAYER.SOLID at alpha 1, so the
  * authored value IS the on-screen value — no transmission arithmetic any more.
@@ -101,16 +116,30 @@ const BAND_BLOBS    = Int32Array.of(1, 1, 1, 1, 2);
  * hue). Past ~4 the ACES curve in post pulls every channel to white and saturated
  * neon turns into grey mush, which is the single easiest way to make this scene
  * look cheap. Far bands are dimmer so aerial perspective survives.
+ *
+ * THE FLOOR MATTERS AS MUCH AS THE CEILING. Signs are tinted from NEON_SET, which is
+ * built from the LDR palette entries (peak <= 1.0, not the *Hot variants at 2.6–3.0).
+ * With the old 0.85/1.00 on the two furthest bands, a sign's final value came out at
+ * 0.33–0.93 — below the post stack's THRESHOLD_HDR of 1.0, i.e. it NEVER crossed the
+ * bright pass and never got a halo. Half the city was literally unlit flat cards,
+ * which is DESIGN.md's first rule ("nothing is flat") broken across most of the frame.
+ * The floor is now set so that band 0's dimmest sign still clears 1.0 after aerial
+ * perspective and the flicker trough.
+ *
+ * The near end is NOT monotonic: band 5 sits below band 4. It is the closest band and
+ * therefore the one whose emitters cover the most screen area, so it is the one that
+ * behaves most like a pedestal; 2.15 there cost ~3 points of measured true black and
+ * bought nothing, since everything it emits is well over the bloom threshold anyway.
  */
-const BAND_EMIT     = Float32Array.of(0.85, 1.00, 1.20, 1.45, 1.70);
+const BAND_EMIT     = Float32Array.of(1.35, 1.55, 1.70, 1.85, 2.00, 1.95);
 /**
  * Per-band column cap, sized so the whole backdrop cannot exceed ~800 primitives
  * however wide the viewport gets. At CFG.VIEW_WIDTH the real counts are roughly
- * 17/14/11/9/7, so this never engages in the shipping configuration — it is a
+ * 17/14/11/9/7/6, so this never engages in the shipping configuration — it is a
  * safety net. When it does engage the band strides (draws every Nth column) rather
  * than truncating, so the skyline still spans the frame, just sparser.
  */
-const BAND_MAX_COLS = Int32Array.of(30, 26, 20, 16, 12);
+const BAND_MAX_COLS = Int32Array.of(30, 26, 20, 16, 12, 10);
 
 // Foreground streak band.
 const FG_PARALLAX = 1.30;
@@ -121,12 +150,27 @@ const FG_FILL     = 0.50;
  *  it, so the on-screen contribution is colour × core × FACADE_HAZE_A². */
 const FACADE_HAZE_A = 0.42;
 
-const RAIN_COUNT    = 130;
+const RAIN_COUNT    = 190;
 const RAIN_FALL     = 96;    // world units / s at depth 1
 const RAIN_WIND     = 13;    // ambient leftward wind
-const RAIN_SHEAR    = 0.78;  // how much of the player's speed shears the streaks
 const RAIN_LEN_MIN  = 2.0;
 const RAIN_LEN_MAX  = 11.5;
+/**
+ * Rain parallax, as a drag coefficient on the camera's own motion: a drop at depth d
+ * is dragged by RAIN_PAR_MIN + d * RAIN_PAR_K of the camera delta, in BOTH axes.
+ *
+ * Note the shape of this. The pool is stored screen-relative (that is what makes it
+ * trivially wrap-safe), and for a screen-relative pool the renderer's `parallax`
+ * field is a no-op: the primitive is emitted at cam + offset, so cam*p cancels out of
+ * `world - cam*p` up to a constant, and any residual (1-p)*cam grows without bound
+ * and walks the whole field off screen inside a few seconds. The parallax therefore
+ * has to be applied by hand, here, to the stored offsets — which is also the only
+ * place it can pick up VERTICAL camera motion. Previously there was none at all: a
+ * dive left the rain perfectly still relative to the screen, which is most of why it
+ * read as a printed hatch rather than as weather.
+ */
+const RAIN_PAR_MIN  = 0.62;
+const RAIN_PAR_K    = 0.34;
 
 const TRAFFIC_COUNT = 8;
 const SHAFT_COUNT   = 6;
@@ -209,6 +253,8 @@ export class Backdrop {
     this.od = 0;         // overdrive01, smoothed
     this.speed01 = 0;
     this.speed = 0;
+    this.camVX = 0;      // camera velocity, world units/s — drives the rain streaks
+    this.camVY = 0;
     this.debugCount = 0;
 
     // Cached view extents in world units; update() runs before render() and needs
@@ -253,11 +299,18 @@ export class Backdrop {
     this.rnA = new Float32Array(RAIN_COUNT);  // per-drop shear jitter — breaks up
                                               // the hatch pattern a single shared
                                               // wind vector otherwise produces
+    // Previous camera position, so update() can derive the per-frame camera delta the
+    // rain parallax is driven from. NaN-safe: seeded on the first update() call.
+    this.pcx = NaN;
+    this.pcy = NaN;
+
     for (let i = 0; i < RAIN_COUNT; i++) {
       this.rnX[i] = rng.range(-1, 1) * this.halfW * 1.3;
       this.rnY[i] = rng.range(-1, 1) * this.halfH * 1.2;
-      // 12% of the pool sits very close to the lens: fat, fast and out of focus.
-      this.rnD[i] = rng() < 0.12 ? rng.range(1.55, 2.25) : rng.range(0.55, 1.15);
+      // 22% of the pool sits very close to the lens: fat, fast and out of focus.
+      // Raised from 12% because the near drops are now the only white ones — see
+      // _rain() — and at 12% the frame had almost no bright rain left in it.
+      this.rnD[i] = rng() < 0.22 ? rng.range(1.55, 2.25) : rng.range(0.55, 1.15);
       this.rnL[i] = rng.range(0.50, 1.75);
       this.rnB[i] = rng.range(0.22, 1.0);
       this.rnA[i] = rng.range(0.80, 1.26);
@@ -341,15 +394,30 @@ export class Backdrop {
     const hw = this.halfW, hh = this.halfH;
 
     // ── Rain ──────────────────────────────────────────────────────────────────
-    // Screen-relative motion. The camera chasing forward is what makes rain
-    // stream backwards, so the player's speed drives the horizontal component
-    // directly; the same vector shears the streaks in render().
-    const windX = RAIN_WIND + this.speed * RAIN_SHEAR;
+    // Two components, and the separation is the whole point:
+    //   1. the drop's own motion — ambient wind and gravity, depth-scaled;
+    //   2. camera drag — the camera's actual per-frame delta times the drop's own
+    //      parallax coefficient. This is the parallax (see RAIN_PAR_MIN), and it is
+    //      what makes a near drop rip past the lens while a far one crawls, on BOTH
+    //      axes, including on a vertical dive.
+    // Using the real camera delta rather than the player's scalar speed also means
+    // the rain reacts to lookahead, roll settle and the death cam, not just to speed.
+    let dcx = camX - this.pcx, dcy = camY - this.pcy;
+    if (!(dcx === dcx) || !(dcy === dcy)) { dcx = 0; dcy = 0; }   // first frame
+    this.pcx = camX; this.pcy = camY;
+    // Cache the camera velocity for render(): the streak direction must match the
+    // direction the drop is actually travelling, per drop, or every streak in the
+    // frame is parallel and the downpour reads as a printed hatch.
+    const idt = dt > 1e-5 ? 1 / dt : 0;
+    this.camVX = dcx * idt;
+    this.camVY = dcy * idt;
+
     const rainW = hw * 1.35, rainH = hh * 1.25;
     for (let i = 0; i < RAIN_COUNT; i++) {
       const d = this.rnD[i];
-      this.rnX[i] = wrapc(this.rnX[i] - windX * d * dt, rainW);
-      this.rnY[i] = wrapc(this.rnY[i] + RAIN_FALL * (0.55 + 0.6 * d) * dt, rainH);
+      const par = RAIN_PAR_MIN + d * RAIN_PAR_K;
+      this.rnX[i] = wrapc(this.rnX[i] - RAIN_WIND * d * dt - dcx * par, rainW);
+      this.rnY[i] = wrapc(this.rnY[i] + RAIN_FALL * (0.55 + 0.6 * d) * dt - dcy * par, rainH);
     }
 
     // ── Traffic ───────────────────────────────────────────────────────────────
@@ -603,9 +671,19 @@ export class Backdrop {
         const fl = 0.68 + 0.32 * noise1(t * (0.45 + 0.55 * fog) + i * 3.7, seedI);
         // Wider than the tower and very soft: this must read as an ambient lift
         // over a whole slab of facade, never as a discrete blob sitting on it.
-        const rx = hw * 1.25, ry = hw * rr(1.8, 3.2);
+        // ry is capped against the view rather than left proportional to the column.
+        // Band 5's columns are 18 units wide, so an uncapped blob was a 26-unit-tall
+        // ellipse — a wash covering most of the lower frame. The cap keeps the blob a
+        // facade feature at every band width.
+        const rx = hw * 1.25, ry = Math.min(hw * rr(1.8, 3.2), halfH * 0.5);
+        // The coefficient is deliberately BELOW the bloom threshold and stays there.
+        // This is the one emitter in the module that covers real area, so it is also
+        // the only one that behaves as a pedestal — every 0.01 here is a global black
+        // level lift. It was rebalanced down by ~0.62x when BAND_EMIT was raised, so
+        // that the emit rise lands on the signs (which need to cross 1.0 and bloom)
+        // and not on the facade wash (which must never get near it).
         emissive(_cEmit, warm ? PAL.amber : PAL.cyan,
-          emit * rr(0.22, 0.55) * fl * (1 - fog * 0.35), FACADE_HAZE_A, od);
+          emit * rr(0.14, 0.34) * fl * (1 - fog * 0.35), FACADE_HAZE_A, od);
         this._ell(LAYER.SOLID, x + rr(-0.22, 0.22) * hw, by, rx, ry, 0, _cEmit,
           { glow: 0, glowRadius: px * 2, soft: rx * 1.9, parallax: P });
       }
@@ -637,7 +715,7 @@ export class Backdrop {
       }
 
       // ── Signage (LAYER.SOLID) ───────────────────────────────────────────────
-      if (b >= 1) this._signs(b, x, capTop, top, hw, h, baseY, P, px, emit, fog, od);
+      if (b >= 1) this._signs(b, x, capTop, top, hw, h, baseY, P, px, emit, fog, od, halfH);
 
       // ── Antenna spire + aircraft warning light ──────────────────────────────
       if (b >= 1 && h > halfH * 0.22 && rnd() < 0.5) {
@@ -678,12 +756,16 @@ export class Backdrop {
   // wander); ~20% are failing tubes that stutter hard on a thresholded noise, with
   // a fast sub-flicker riding on top. Overdrive drives every rate up via this.t.
   // ═══════════════════════════════════════════════════════════════════════════
-  _signs(b, x, capTop, top, hw, h, baseY, P, px, emit, fog, od) {
+  _signs(b, x, capTop, top, hw, h, baseY, P, px, emit, fog, od, halfH) {
     const t = this.t;
     const seedI = _s | 0;
     // Aerial perspective on emissive: distant signs lose intensity, and lose it
     // faster than they lose chroma, so the far city stays coloured but dim.
-    const aer = 1 - fog * 0.55;
+    // 0.40, not 0.55: at 0.55 the furthest band lost 50% of its emissive and the
+    // result landed under the post stack's 1.0 bloom threshold, so "dim" became
+    // "unlit" — a flat card with no halo at all. Aerial perspective is supposed to
+    // reduce contrast, not switch the lights off.
+    const aer = 1 - fog * 0.40;
 
     // ---- vertical strip: the kanji column running down a facade edge ----------
     if (rnd() < 0.52) {
@@ -727,17 +809,35 @@ export class Backdrop {
 
     // ---- billboard: a big dim panel, the light source for the shafts ---------
     if (b >= 3 && rnd() < 0.30) {
-      const pw = hw * rr(0.55, 1.05);
+      // Sized against the VIEW, not just the column. Every other sign type is a thin
+      // stroke, so scaling it off hw is harmless; the billboard is a filled panel, and
+      // band 5's columns are 18 units wide — off hw alone it came out ~10 units across
+      // and occupied a third of the frame width as one flat colour chip. The cap makes
+      // it a billboard on a building at every band width.
+      const pw = Math.min(hw * rr(0.55, 1.05), halfH * 0.20);
       const phh = pw * rr(0.5, 1.0);
       const py = top + h * rr(0.10, 0.40) + phh;
       const col = NEON_SET[(rnd() * NEON_N) | 0];
       const ph = rnd() * TAU;
-      // Broad and dim: it wants area, not peak. Kept under 1.0 so it reads as a lit
-      // panel rather than another blown-out lamp.
-      const k = emit * 0.42 * this._flick(t, seedI + 211, ph, rnd() < 0.10, 0.45) * aer;
+      // Broad, but no longer dim. At 0.42 the panel landed at 0.33–0.71 — under the
+      // 1.0 bloom threshold — AND was drawn with a 1.4px hard edge, so the largest
+      // emissive object in the backdrop was a flat halo-free slab. 0.85 puts it at
+      // 1.3–1.6: it clears the bright pass by a comfortable margin and gets its halo
+      // from the post chain, which (see the header note) is the only way an emissive
+      // on LAYER.SOLID can have one — the renderer's own `glow` is multiplied by the
+      // fragment's src alpha, which is zero everywhere outside the core.
+      const k = emit * 0.78 * this._flick(t, seedI + 211, ph, rnd() < 0.10, 0.45) * aer;
       emissive(_cEmit, col, k, 1, od);
+      // The other half of the fix: a genuinely soft rim. `soft` is in world units and
+      // feeds smoothstep(soft, -soft, d) for BOTH the core and the alpha, so softening
+      // by three quarters of the panel's own half-height leaves only a small bright
+      // plateau in the middle and a long falloff to the edges — the "dimmer
+      // core-to-edge falloff" DESIGN.md asks for, instead of a die-cut colour chip.
+      // (The instance quad is padded by glowRadius*3 + soft, so the falloff is never
+      // clipped by the quad however large this gets.)
       this._rect(LAYER.SOLID, x + rr(-0.2, 0.2) * hw, py, pw, phh, 0, _cEmit,
-        { glow: 0, glowRadius: px * 2, soft: px * 1.4, radius: pw * 0.12, parallax: P });
+        { glow: 0, glowRadius: px * 2, soft: Math.max(px * 1.4, phh * 0.75),
+          radius: pw * 0.12, parallax: P });
     }
   }
 
@@ -924,31 +1024,38 @@ export class Backdrop {
   // RAIN  —  190 primitives, LAYER.FOREGROUND
   //
   // Fixed pool, screen-relative storage, wrapped every frame — never allocates and
-  // never drifts out of the view no matter what the camera does. The streak vector
-  // is one shared per-frame direction: ambient wind plus RAIN_SHEAR × player speed,
-  // so at terminal velocity the rain lies down into near-horizontal tracers.
+  // never drifts out of the view no matter what the camera does. The streak vector is
+  // computed PER DROP from that drop's own velocity (ambient wind + gravity, minus
+  // the camera drag its depth subjects it to), so at terminal velocity the near rain
+  // lies down into near-horizontal tracers while the far rain is still falling at a
+  // steep angle. That divergence is the depth cue; a single shared angle is not.
   // ═══════════════════════════════════════════════════════════════════════════
   _rain(camX, camY, halfW, halfH, px, od) {
     const s01 = this.speed01;
-
-    // Shared streak direction. dx is negative (rain streams backwards past you).
-    const dx = -(RAIN_WIND + this.speed * RAIN_SHEAR);
-    const dy = RAIN_FALL;
-    const inv = 1 / Math.sqrt(dx * dx + dy * dy);
-    const ux = dx * inv, uy = dy * inv;
+    // Camera velocity, which the drops are dragged by. Clamped so a restart teleport
+    // or a tab-switch spike cannot lay every streak flat for one frame.
+    const cvx = Math.max(-260, Math.min(260, this.camVX));
+    const cvy = Math.max(-260, Math.min(260, this.camVY));
 
     const baseLen = lerp(RAIN_LEN_MIN, RAIN_LEN_MAX, s01 * s01 * 0.55 + s01 * 0.45);
 
     for (let i = 0; i < RAIN_COUNT; i++) {
       const d = this.rnD[i];
       const near = d > 1.4;
+      const par = RAIN_PAR_MIN + d * RAIN_PAR_K;
       const x0 = camX + this.rnX[i];
       const y0 = camY + this.rnY[i];
+
+      // PER-DROP streak direction, not one shared vector: the drop's own velocity is
+      // (its wind + gravity) minus (the camera drag it is subject to), and that
+      // differs by depth. A single shared direction is exactly what turns 190 lines
+      // into a silkscreen. rnA jitters it further so no two are quite parallel.
+      const vx = -RAIN_WIND * d - cvx * par;
+      const vy = RAIN_FALL * (0.55 + 0.6 * d) - cvy * par;
+      const inv = 1 / Math.sqrt(vx * vx + vy * vy + 1e-6);
       const len = baseLen * this.rnL[i] * d;
-      // Per-drop shear jitter: without it every streak is exactly parallel and the
-      // whole screen reads as a printed hatch rather than as weather.
-      const x1 = x0 + ux * len * this.rnA[i];
-      const y1 = y0 + uy * len;
+      const x1 = x0 + vx * inv * len * this.rnA[i];
+      const y1 = y0 + vy * inv * len;
 
       // Close drops are fatter, dimmer per unit area and defocused; far drops are
       // hairline-thin and crisp. That contrast is the whole depth read.
@@ -957,7 +1064,16 @@ export class Backdrop {
       const smear = 1 / (0.5 + 0.5 * (len / RAIN_LEN_MIN));
       const a = this.rnB[i] * (near ? 0.13 : 0.42) * smear;
 
-      emissive(_cRain, near ? PAL.cyan : PAL.hot, (near ? 0.24 : 0.34) * a, 1, od * 0.35);
+      // WHITE IS FOR THE FEW. This was inverted: PAL.hot on the far drops meant ~88%
+      // of the rain — the single most numerous primitive in the frame — was neutral
+      // white, which is the largest source of desaturated pixels in the whole game.
+      // Only the near-lens drops are white now (they are close enough to be lit by
+      // the player); everything behind them is cyan, and gets a compensating gain
+      // because cyan carries ~0.79 of hot's luma. 0.40, not the naive 0.46: the pool
+      // also grew 130 -> 190, so a full per-drop luma match would have put ~35% more
+      // total energy on FOREGROUND (which is additive over everything) and spent it
+      // all on the black point.
+      emissive(_cRain, near ? PAL.hot : PAL.cyan, (near ? 0.24 : 0.40) * a, 1, od * 0.35);
       this._line(LAYER.FOREGROUND, x0, y0, x1, y1, w, _cRain,
         { glow: near ? 1.1 : 0.55, glowRadius: near ? w * 5 : w * 2.6,
           soft: near ? px * 4.5 : px * 0.95, parallax: 1 });
@@ -969,7 +1085,9 @@ export class Backdrop {
       const ph = i * 2.399;
       const sxp = camX + Math.sin(this.drift * (0.21 + i * 0.07) + ph) * halfW * 0.9;
       const syp = camY + Math.cos(this.drift * 0.13 + ph) * halfH * 0.35;
-      const rot = Math.atan2(uy, ux);
+      // Sheared along the mid-depth drop direction (d = 1), so the squall lies down
+      // with the downpour instead of at its own angle.
+      const rot = Math.atan2(RAIN_FALL * 1.15 - cvy * 0.96, -RAIN_WIND - cvx * 0.96);
       emissive(_cRain, PAL.cyan, 0.0022 * (0.6 + 0.4 * Math.sin(this.drift * 0.9 + ph)), 1, od * 0.4);
       this._ell(LAYER.FOREGROUND, sxp, syp, halfH * (0.8 + 0.3 * i), halfW * 0.75, rot, _cRain,
         { glow: 0.12, glowRadius: halfW * 0.5, soft: halfW * 1.1, parallax: 1 });

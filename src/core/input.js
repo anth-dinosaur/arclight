@@ -6,7 +6,9 @@
 //  - `touch-action: none` in CSS stops scroll/zoom, but we still preventDefault on
 //    touchstart to suppress the 300ms synthetic mouse cascade and double-tap zoom.
 //  - Touches that begin on a UI button must not drive gameplay, so we ignore events
-//    whose target is inside an interactive element.
+//    whose target is inside an interactive element — unless that UI explicitly hands
+//    the pointer over with `adopt()`, which is how press-and-hold on LAUNCH flows
+//    straight into the first swing without lifting a thumb.
 //  - Losing the page (backgrounding, incoming call) must release cleanly.
 
 export class Input {
@@ -68,6 +70,14 @@ export class Input {
     this.pressed = this.down && !this._wasDown;
     this.released = !this.down && this._wasDown;
     this._wasDown = this.down;
+  }
+
+  /** Adopt a pointer that started on a UI element (e.g. the LAUNCH button)
+   *  so a tap-and-hold flows straight into gameplay without lifting. */
+  adopt(pointerId) {
+    if (!this._enabled) return;
+    if (pointerId !== undefined && pointerId !== null) this._pointers.add(pointerId);
+    this.down = true;
   }
 
   /** Suppress gameplay input (e.g. while a menu is up) without losing listeners. */

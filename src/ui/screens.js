@@ -8,9 +8,15 @@
 // stats: { distance, score, best, bestDistance, multiplierPeak, perfects, isNewBest }
 //
 // Notes on touch:
-//   * The root and both screen containers are `pointer-events: none`. Only the
-//     three <button>s opt back in. Gameplay touches must reach main.js's window
-//     listener everywhere else on the screen, including over the panels.
+//   * The root and the TITLE container are `pointer-events: none`. Gameplay
+//     touches must reach main.js's window listener everywhere else on the
+//     screen, including over the panels.
+//   * The GAME-OVER container is the one exception: it opts in and retries on a
+//     tap anywhere. In a game whose entire control scheme is "touch down, touch
+//     up", the death screen must not be the only surface you have to aim at.
+//     The RETRY button stays as the visual affordance and stops propagation, so
+//     the two never double-fire. Nothing is live under the title screen, where
+//     LAUNCH doubles as the WebAudio unlock gesture and needs a real target.
 //   * The title's primary button fires on a real `pointerdown` so it can serve
 //     as the WebAudio unlock gesture; a `click` fallback is deduped by
 //     timestamp for browsers without PointerEvent.
@@ -38,6 +44,7 @@ export class Screens {
     this._visible = false;
     this._which = '';          // '', 'title' or 'over'
     this._raf = 0;
+    this._showRaf = 0;
     this._hideTimer = 0;
 
     // Best-known personal best, seeded from localStorage and kept current from
@@ -113,7 +120,7 @@ export class Screens {
     how.appendChild(el('div', 'panel-hd', 'HOW'));
     how.appendChild(howRow('01', 'HOLD', 'Anywhere. A tether fires at the best anchor ahead and you swing.'));
     how.appendChild(howRow('02', 'RELEASE', 'Let go. You keep every bit of the momentum you built.'));
-    how.appendChild(howRow('03', 'RELEASE RISING', 'Let go while climbing 15°–55° for a <b>PERFECT ARC</b>.'));
+    how.appendChild(howRow('03', 'RELEASE RISING', 'Let go while climbing 11°–65° for a <b>PERFECT ARC</b>.'));
     body.appendChild(how);
 
     scr.appendChild(body);
@@ -122,19 +129,19 @@ export class Screens {
     this.titleBest = el('div', 'best-line stagger');
     foot.appendChild(this.titleBest);
 
-    const btn = this.startBtn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn btn--pulse stagger';
-    btn.textContent = 'LAUNCH';
+    const btn = this.startBtn = button('LAUNCH');
     // Real pointerdown → valid user gesture for AudioContext.resume().
-    bindTap(btn, () => {
+    bindTap(btn, (e) => {
       if (this._which !== 'title') return;
       this.hide();
-      if (this.cb.onStart) this.cb.onStart();
+      if (this.cb.onStart) this.cb.onStart(e);
     });
     foot.appendChild(btn);
 
-    foot.appendChild(el('div', 'btn-hint stagger', 'ONE THUMB. NO BUTTONS.'));
+    // The one instruction that matters belongs on the screen you read BEFORE
+    // you play. "ONE THUMB. NO BUTTONS." describes the scheme without ever
+    // saying what to do with it.
+    foot.appendChild(el('div', 'btn-hint stagger', 'TOUCH AND HOLD ANYWHERE'));
     scr.appendChild(foot);
     return scr;
   }
@@ -173,17 +180,18 @@ export class Screens {
     scr.appendChild(body);
 
     const foot = el('div', 'scr-foot');
-    const btn = this.retryBtn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'btn btn--pulse stagger';
-    btn.textContent = 'RETRY';
-    bindTap(btn, () => {
+    const btn = this.retryBtn = button('RETRY');
+    const retry = (e) => {
       if (this._which !== 'over') return;
       this.hide();
-      if (this.cb.onRetry) this.cb.onRetry();
-    });
+      if (this.cb.onRetry) this.cb.onRetry(e);
+    };
+    bindTap(btn, retry);
+    // Tap anywhere. `bindTap` stops propagation on the button, so a hit on the
+    // button never reaches this and never fires `retry` twice.
+    bindTap(scr, retry);
     foot.appendChild(btn);
-    foot.appendChild(el('div', 'btn-hint stagger', 'TAP AND HOLD TO TETHER'));
+    foot.appendChild(el('div', 'btn-hint stagger', 'ONE TAP TO GO AGAIN'));
     scr.appendChild(foot);
     return scr;
   }
@@ -202,7 +210,7 @@ export class Screens {
     this._visible = true;
     this._which = 'title';
     // Force a frame between display and class so the transition actually runs.
-    show(this.titleEl);
+    this._show(this.titleEl, 'title');
   }
 
   /** @param {{distance:number,score:number,best:number,bestDistance:number,
@@ -224,7 +232,7 @@ export class Screens {
 
     this._visible = true;
     this._which = 'over';
-    show(this.overEl);
+    this._show(this.overEl, 'over');
 
     // Count-up. rAF tween, eased, staggered per row so the readout assembles
     // itself like a terminal printing results.
@@ -240,6 +248,7 @@ export class Screens {
   hide() {
     if (!this._visible && !this._which) return;
     this._cancelTween();
+    this._cancelShow();
     this.titleEl.classList.remove('is-in');
     this.overEl.classList.remove('is-in');
     this.newBest.classList.remove('is-on');
@@ -276,10 +285,12 @@ export class Screens {
     targets[3] = perfects; targets[4] = best;
 
     rows[2].mult = true;                       // PEAK MULT prints ×N, not N
-    // Seed at zero so the first painted frame is not the final number.
+    // Seed at the floor so the first painted frame is not the final number.
+    // The multiplier row counts from ×1, not ×0 — ×0 is not a state the game can
+    // ever be in, and printing it makes the whole report look uncalibrated.
     for (let i = 0; i < rows.length; i++) {
       rows[i].last = -1;
-      rows[i].node.textContent = rows[i].mult ? '×0' : '0';
+      rows[i].node.textContent = rows[i].mult ? '×1' : '0';
     }
 
     const step = (now) => {
@@ -291,8 +302,9 @@ export class Screens {
         if (local <= 0) { k = 0; done = false; }
         else if (local >= 1) { k = 1; }
         else { k = 1 - Math.pow(1 - local, 3); done = false; }  // easeOutCubic
-        const v = Math.round(targets[i] * k);
         const r = rows[i];
+        let v = Math.round(targets[i] * k);
+        if (r.mult && v < 1) v = 1;             // the multiplier floor is ×1
         if (v !== r.last) {
           r.last = v;
           r.node.textContent = r.mult ? ('×' + v) : fmt(v);
@@ -306,7 +318,8 @@ export class Screens {
         this._raf = 0;
         for (let i = 0; i < rows.length; i++) {
           const r = rows[i];
-          const v = Math.round(targets[i]);
+          let v = Math.round(targets[i]);
+          if (r.mult && v < 1) v = 1;
           if (v !== r.last) { r.last = v; r.node.textContent = r.mult ? ('×' + v) : fmt(v); }
         }
       }
@@ -316,6 +329,34 @@ export class Screens {
 
   _cancelTween() {
     if (this._raf) { cancelAnimationFrame(this._raf); this._raf = 0; }
+  }
+
+  /**
+   * Two-step reveal: make the element paintable, then flip the class on the NEXT
+   * frame so the CSS transition has a start state to move from.
+   *
+   * The guard is load-bearing. A retry can land inside the two-frame gap — the
+   * measured pointerdown → PLAY path is 65ms and this gap is ~33ms, and making
+   * game over tap-anywhere widened the target from one button to the whole
+   * screen. Unguarded, the queued callback re-adds `is-in` AFTER hide() removed
+   * it: `.scr.is-in` also sets `visibility: visible`, so `hideNow()` cannot take
+   * it back and the game-over panel stays pinned at full opacity over live
+   * gameplay, frozen on the cancelled count-up's zeros, for the rest of the
+   * session. Cancel the pending frame on hide, and re-check on arrival.
+   */
+  _show(node, which) {
+    this._cancelShow();
+    node.style.visibility = 'visible';
+    this._showRaf = requestAnimationFrame(() => {
+      this._showRaf = requestAnimationFrame(() => {
+        this._showRaf = 0;
+        if (this._which === which) node.classList.add('is-in');
+      });
+    });
+  }
+
+  _cancelShow() {
+    if (this._showRaf) { cancelAnimationFrame(this._showRaf); this._showRaf = 0; }
   }
 
   _clearHideTimer() {
@@ -345,6 +386,17 @@ function el(tag, cls, text) {
   if (cls) n.className = cls;
   if (text !== undefined) n.textContent = text;
   return n;
+}
+
+/** Primary CTA. The label lives in its own span so ui.css can stack a 1px rim
+ *  pseudo under a separate gradient-fill pseudo and still keep the text on top —
+ *  a plain inset box-shadow gets cut away by the notched clip-path. */
+function button(label) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'btn btn--pulse stagger';
+  b.appendChild(el('span', 'btn-l', label));
+  return b;
 }
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -387,14 +439,6 @@ function statRow(self, label, key, hero, unit) {
   return row;
 }
 
-/** Two-step reveal: make the element paintable, then flip the class on the
- *  next frame so the CSS transition has a start state to move from. */
-function show(node) {
-  node.style.visibility = 'visible';
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => node.classList.add('is-in'));
-  });
-}
 function hideNow(node) { node.style.visibility = ''; }
 
 /** Thousands separators without toLocaleString (consistent across locales). */
@@ -424,7 +468,7 @@ function bindTap(node, fn) {
     last = now;
     e.preventDefault();
     e.stopPropagation();                     // never leaks into gameplay input
-    fn();
+    fn(e);                                   // forwarded so main.js can Input.adopt()
   };
   if (typeof window.PointerEvent === 'function') {
     node.addEventListener('pointerdown', fire, { passive: false });

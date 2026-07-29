@@ -113,8 +113,11 @@ const CATCH_P       = CFG.WORLD_CATCH_P ?? 0.92;
 const CATCH_Y_MAX   = CFG.WORLD_CATCH_Y_MAX ?? (FLOODLINE - 13);
 
 // Difficulty curve. `diff` is asymptotic: 1 - e^-((x - TUT) / SCALE).
+// SCALE was 1400, which at the ~46 world-u/s cruise put the curve half-run by 30s.
+// 2200 stretches the same shape over the distance a competent player actually covers
+// before the run ends, so the ramp is felt as progression rather than as an ambush.
 const TUT_DIST     = CFG.TUTORIAL_DIST;
-const DIFF_SCALE   = CFG.WORLD_DIFF_SCALE ?? 1400;
+const DIFF_SCALE   = CFG.WORLD_DIFF_SCALE ?? 2200;
 
 // Anchor spacing. SPACING_MAX is the hard density floor from DESIGN.md — no matter
 // how far you run, anchors never get sparser than this.
@@ -154,19 +157,32 @@ const NOMINAL_ANGLE_I = 2; // -0.50 rad, dead centre of the power window — use
 // Hazards.
 const HAZ_MAX      = CFG.WORLD_HAZ_MAX ?? 3.4;    // asymptotic hazards per chunk
 const HAZ_POW      = CFG.WORLD_HAZ_POW ?? 1.25;   // shapes the early ramp (>1 = gentler start)
-const HAZ_CLEAR    = CFG.WORLD_HAZ_CLEAR ?? 6.5;  // hazards keep this far from any anchor
+/** Hazards keep this far from any anchor. Was 6.5, which — together with the off-lane
+ *  push in _placeGenericHazard — evacuated the entire reachable corridor of anything
+ *  grazable: only 0.9% of frames were ever within GRAZE_RADIUS of a live hazard. The
+ *  graze band cannot find geometry in airspace the generator has cleared of geometry. */
+const HAZ_CLEAR    = CFG.WORLD_HAZ_CLEAR ?? 5.0;
 /** Beams get extra room: you swing a full rope-length around an anchor, so a beam that
  *  merely misses the node still sweeps the arc you are riding on it. */
-const HAZ_CLEAR_LASER = CFG.WORLD_HAZ_CLEAR_LASER ?? 9.5;
+const HAZ_CLEAR_LASER = CFG.WORLD_HAZ_CLEAR_LASER ?? 7.5;
 /** Minimum X separation between hazards. Threats need to arrive as separate beats — a
  *  cluster with no gap to react in is noise, not difficulty. The gap closes with
  *  difficulty: that tightening *is* the late-game ramp, rather than a fixed spacing
- *  that would silently cap density and flatten the curve. */
-const HAZ_SEP_EARLY = CFG.WORLD_HAZ_SEP_EARLY ?? 25;
-const HAZ_SEP_LATE  = CFG.WORLD_HAZ_SEP_LATE ?? 10;
-const HAZ_DRONE_X  = CFG.WORLD_HAZ_DRONE_X ?? 620;   // metres before drones appear
-const HAZ_SPIN_X   = CFG.WORLD_HAZ_SPIN_X ?? 1250;   // ... spinners
-const HAZ_GATE_X   = CFG.WORLD_HAZ_GATE_X ?? 1850;   // ... moving gates
+ *  that would silently cap density and flatten the curve.
+ *
+ *  These are METRES but the thing they are really rationing is SECONDS. At the 25/10
+ *  they were, threat arrival scaled inversely with speed, so flying well made the
+ *  game arrive 3x faster per second survived while halving the reaction window —
+ *  skill was strictly anti-correlated with survival. 34/18 restores roughly constant
+ *  arrival time at cruise, which is what makes going fast a choice rather than a tax. */
+const HAZ_SEP_EARLY = CFG.WORLD_HAZ_SEP_EARLY ?? 34;
+const HAZ_SEP_LATE  = CFG.WORLD_HAZ_SEP_LATE ?? 18;
+// Distance before each kind unlocks. All pushed out to sit behind the extended
+// tutorial (TUTORIAL_DIST 800): a drone at 620 arrived 13.2s into the run, inside the
+// grace period DESIGN.md L1 promises.
+const HAZ_DRONE_X  = CFG.WORLD_HAZ_DRONE_X ?? 1000;  // metres before drones appear
+const HAZ_SPIN_X   = CFG.WORLD_HAZ_SPIN_X ?? 1900;   // ... spinners
+const HAZ_GATE_X   = CFG.WORLD_HAZ_GATE_X ?? 2900;   // ... moving gates
 // Laser duty cycle. The period and the lethal fraction are both eased by difficulty:
 // the first beams a player ever meets are off for ~2.4s at a time, the late ones for
 // ~1.4s. A beam you cannot wait out is not a hazard, it is a wall.
@@ -175,7 +191,21 @@ const LASER_PERIOD_EARLY = CFG.WORLD_LASER_PERIOD_EARLY ?? 3.3;
 const LASER_ON     = CFG.WORLD_LASER_ON ?? 0.46;  // fraction of the cycle the beam is lethal
 const LASER_ON_EARLY = CFG.WORLD_LASER_ON_EARLY ?? 0.26;
 const LASER_TELL   = CFG.WORLD_LASER_TELL ?? 0.4; // seconds of charge-up telegraph
-const DRONE_SPEED  = CFG.WORLD_DRONE_SPEED ?? 6.0;
+/**
+ * DRONE DUTY CYCLE. Drones were 53% of all deaths (31 of 59) and the only hazard in
+ * the game with no timing-out: lasers are lethal 26-46% of a cycle behind a 0.4s
+ * tell, spinners have gaps, gates have a gap. A drone was a pure POSITION threat with
+ * no telegraph, sweeping a corridor a committed half-swing (~0.98s) cannot leave.
+ * Giving it the laser's machinery converts it into a timing threat: a swing you have
+ * already committed to can now survive one by arriving while it is dormant.
+ * 65% of a 2.2s period leaves a 0.77s window, comfortably above the 0.4s tell.
+ */
+const DRONE_PERIOD = CFG.WORLD_DRONE_PERIOD ?? 2.2;
+const DRONE_ON     = CFG.WORLD_DRONE_ON ?? 0.65;  // fraction of the cycle it is lethal
+const DRONE_TELL   = CFG.WORLD_DRONE_TELL ?? 0.45; // seconds of spool-up telegraph
+/** Patrol speed. 6.0 made the sweep faster than a player could read across a corridor
+ *  they were already committed to; 4.0 keeps the pocket legible. */
+const DRONE_SPEED  = CFG.WORLD_DRONE_SPEED ?? 4.0;
 const SPINNER_RATE = CFG.WORLD_SPINNER_RATE ?? 1.5;
 const GATE_RATE    = CFG.WORLD_GATE_RATE ?? 0.55;
 const GATE_GAP     = CFG.WORLD_GATE_GAP ?? 11;
@@ -378,13 +408,17 @@ export class World {
     // documented in the module report): `chunk` (owning chunk index, for streaming),
     // `hx/hy` (home position for movers/bobbers), `amp/rate/sgn` (motion params),
     // `decayT` (decaying-anchor timer), `nx/ny/hasNext` (cable-span link).
+    // `_grazeCd` is owned and decremented by the player's graze band; it lives on the
+    // pooled object so the hidden class never changes mid-run.
     this._pAnchor = new Pool(MAX_ANCHORS, () => ({
       x: 0, y: 0, r: A_R, alive: false, kind: 0, phase: 0, used: false,
-      chunk: 0, decayT: 0, nx: 0, ny: 0, hasNext: false, isCatch: false,
+      chunk: 0, decayT: 0, nx: 0, ny: 0, hasNext: false, isCatch: false, _grazeCd: 0,
     }));
+    // `per`/`duty`/`dphase` are the drone's lethality cycle — see _animate case 1.
     this._pHazard = new Pool(MAX_HAZARDS, () => ({
       x: 0, y: 0, hw: 1, hh: 1, rot: 0, kind: 0, alive: false, phase: 0, vx: 0, vy: 0,
       chunk: 0, hx: 0, hy: 0, amp: 0, rate: 0, sgn: 1, tell: 0,
+      per: 0, duty: 0, dphase: 0, _grazeCd: 0,
     }));
     this._pOrb = new Pool(MAX_ORBS, () => ({
       x: 0, y: 0, r: ORB_R, alive: false, phase: 0, collected: false,
@@ -576,6 +610,16 @@ export class World {
           } else {         // vertical patrol
             h.x = h.hx; h.y = h.hy + s * h.amp;
             h.vx = 0; h.vy = cs * h.amp * h.rate;
+          }
+          // Lethality cycle, same shape as the laser's: dormant for the tail of the
+          // period, with a spool-up tell in the last DRONE_TELL seconds of that gap.
+          // `alive` is the physics switch, so a dormant drone is genuinely passable.
+          if (h.per > 0) {
+            let c = (t / h.per + h.dphase) % 1;
+            if (c < 0) c += 1;
+            h.alive = c < h.duty;
+            const tellFrac = DRONE_TELL / h.per;
+            h.tell = c >= 1 - tellFrac ? (c - (1 - tellFrac)) / tellFrac : 0;
           }
           break;
         }
@@ -909,6 +953,7 @@ export class World {
     a.chunk = ci;
     a.decayT = DECAY_TIME;
     a.nx = 0; a.ny = 0; a.hasNext = false;
+    a._grazeCd = 0;             // pooled: never inherit the last tenant's graze cooldown
     a.isCatch = this._chainN > 0 && this._chunkN >= this._chainN;
     const n = this._chunkN;
     CA_X[n] = x; CA_Y[n] = y; CA_K[n] = kind; CA_REF[n] = a;
@@ -1198,7 +1243,13 @@ export class World {
       // one that covers a side leaves a line through it as well as a moment.
       const ox = this._rj(sp * 0.18);
       const side = this._rc(0.5) ? 1 : -1;
-      const oy = side * this._rr(4.5, 11) + this._rj(1.5);
+      // The off-lane push has to leave the hazard inside the GRAZE band, or L3 has
+      // nothing to reward. The band's outer edge is PLAYER_RADIUS + GRAZE_RADIUS =
+      // 4.25m; a minimum offset of 4.5m therefore placed every hazard just outside
+      // it BY CONSTRUCTION, and grazes-per-run sat at 2.0. 3.0-8.0 overlaps the band
+      // while still keeping the threat off the centreline, so there is a line
+      // through as well as a moment.
+      const oy = side * this._rr(3.0, 8.0) + this._rj(1.5);
       const hx = bx + ox, hy = clamp(by + oy, Y_MIN + 4, Y_MAX + 14);
       const relax = attempt >= 8 ? 0.78 : 1;
       const clearNeed = (kind === 0 ? HAZ_CLEAR_LASER : HAZ_CLEAR) * relax;
@@ -1213,11 +1264,15 @@ export class World {
           this._rc(0.75) ? Math.PI * 0.5 + this._rj(0.3) : this._rj(0.5));
         if (h) h.phase = this._rnd();
       } else if (kind === 1) {
-        // Drone: patrols a straight leg, vertical more often than horizontal.
-        const h = this._emitHazard(ci, 1, hx, hy, 1.5, 1.1, 0);
+        // Drone: patrols a straight leg, ALONG the corridor more often than across it.
+        // It used to be 65% vertical — sweeping the exact axis a swing arc travels,
+        // so the patrol and the player were always closing on each other. Biasing it
+        // horizontal makes the drone something you overtake or fall behind, which is
+        // a relationship a committed swing can still change.
+        const h = this._emitHazard(ci, 1, hx, hy, 1.15, 0.85, 0);
         if (h) {
           h.hx = hx; h.hy = hy;
-          h.sgn = this._rc(0.35) ? 1 : -1;
+          h.sgn = this._rc(0.7) ? 1 : -1;
           // Patrol legs stay short: a drone should own a pocket of the lane you can
           // read and route around, not sweep the whole corridor.
           h.amp = this._rr(3.5, 7);
@@ -1261,11 +1316,19 @@ export class World {
     h.phase = hash2(Math.round(x * 4) ^ kind, Math.round(y * 4) ^ ci);
     h.vx = 0; h.vy = 0;
     h.amp = 0; h.rate = 1; h.sgn = 1; h.tell = 0;
+    h.per = 0; h.duty = 0; h.dphase = 0; h._grazeCd = 0;
     if (kind === 0) {
       // `rate` carries the cycle period and `amp` the lethal fraction, both eased so a
       // player's first encounters have a long, obvious, survivable gap.
       h.rate = lerp(LASER_PERIOD_EARLY, LASER_PERIOD, this._diff);
       h.amp = lerp(LASER_ON_EARLY, LASER_ON, this._diff);
+    } else if (kind === 1) {
+      // Drones carry their lethality cycle separately from their patrol motion
+      // (`rate`/`amp`/`phase`), so the dormant window lands at a different point of
+      // the sweep for every unit and the field never pulses in lockstep.
+      h.per = DRONE_PERIOD;
+      h.duty = DRONE_ON;
+      h.dphase = hash2(Math.round(x * 8) ^ 0x5bf0, Math.round(y * 8) ^ ci);
     }
     h.chunk = ci;
     this._chunkH++;
@@ -1586,7 +1649,13 @@ export class World {
       // Neon edge along the top face — the single line that cuts the shape out of
       // the dark. Flickers on a per-object noise seed, like real bad wiring.
       const flick = 0.82 + 0.18 * Math.sin(time * (2.1 + h * 3) + h * 40);
-      const edgeCol = h > 0.62 ? PAL.cyanHot : PAL.violetHot;
+      // COLOUR CONTRACT. DESIGN.md assigns cyan to "player, tether, safe things" and
+      // magenta to "hazards, danger". SOLIDs kill on contact, so ~38% of the lethal
+      // geometry in the frame used to carry a cyanHot top edge — the same hue and the
+      // same glow as the player's own body. Cyan is now reserved for the player, the
+      // tether and the heavy (safe) anchor ring; structure reads violet and the faces
+      // that will actually kill you read magenta.
+      const edgeCol = h > 0.62 ? PAL.violetHot : PAL.magentaHot;
       tint(SC1, edgeCol, (0.34 + 0.20 * h) * flick, 1);
       const c = Math.cos(s.rot), sn = Math.sin(s.rot);
       const ex = s.hw * c, ey = s.hw * sn;
@@ -1627,20 +1696,29 @@ export class World {
       const ph = o.phase * TAU;
       const br = 0.75 + 0.25 * Math.sin(time * 3.1 + ph);
 
-      // A small bright bead, not a sun: a tight corona, a thin rotating ring, and a
-      // single hot pip in the middle that is the only part allowed to clip to white.
+      // SHAPE LANGUAGE. An orb is a filled DISC; an anchor is an open RING; a hazard
+      // is a bar or a blade. Orbs used to be a thin rotating ring around a small pip,
+      // which is the anchor's silhouette in a different colour — at speed, in the
+      // periphery, the two were the same object. The disc now carries the read and the
+      // only ring left on screen means "you can tether here".
+      //
+      // Corona at 1.7 radii, not 2.4: orbs spawn in short runs, and at 2.4 adjacent
+      // coronas overlapped and bloomed into one continuous amber lozenge, destroying
+      // the count (which is the only thing the player needs from an orb line).
       tint(SC0, PAL.amberHot, 0.10 * br, 1);
-      r.glow(LAYER.FAR_GLOW, o.x, o.y, o.r * 2.4, SC0);
+      r.glow(LAYER.FAR_GLOW, o.x, o.y, o.r * 1.7, SC0);
       pc++;
 
-      tint(SC1, PAL.amberHot, 0.34 * br, 1);
-      r.ring(LAYER.NEON, o.x, o.y, o.r * 1.45, 0.075, SC1,
-        { glow: 0.75, glowRadius: o.r * 0.45, soft: aa, rot: time * 1.6 + ph });
+      tint(SC1, PAL.amberHot, 0.30 + 0.10 * br, 1);
+      r.circle(LAYER.NEON, o.x, o.y, o.r * 0.78, SC1,
+        { glow: 0.7, glowRadius: o.r * 0.55, soft: aa });
       pc++;
 
-      tint(SC2, PAL.amberHot, 0.50 + 0.18 * br, 1);
-      r.circle(LAYER.NEON, o.x, o.y, o.r * 0.38, SC2,
-        { glow: 0.75, glowRadius: o.r * 0.6, soft: aa });
+      // Hot centre — the one element allowed to clip to white, kept small so the disc
+      // still reads as a disc rather than as a ball of light.
+      tint(SC2, PAL.amberHot, 0.55 + 0.20 * br, 1);
+      r.circle(LAYER.NEON, o.x, o.y, o.r * 0.34, SC2,
+        { glow: 0.75, glowRadius: o.r * 0.5, soft: aa });
       pc++;
     }
     return pc;
@@ -1716,34 +1794,54 @@ export class World {
     return pc;
   }
 
-  /** Drone: a dark hull with a magenta scanning eye-cone that sweeps as it patrols. */
+  /**
+   * Drone: a dark hull with a magenta scanning eye-cone that sweeps as it patrols.
+   *
+   * BRIGHTNESS IS LOAD-BEARING HERE. The drone was the game's single biggest killer
+   * (53% of deaths) and simultaneously the darkest object in it — its ring sat at
+   * magentaHot * 0.52 against a laser core at hot * 1.05. The #1 threat must not be
+   * the hardest thing to see. The ring is now the brightest magenta in the frame when
+   * live, and the halo carries far enough to be findable in peripheral vision.
+   *
+   * The lethality cycle drives the whole read: live = hot ring, bright eye, wide
+   * halo; spooling up = the ring reignites over DRONE_TELL seconds; dormant = dim
+   * hull, dark eye, no halo, and genuinely non-lethal.
+   */
   _drawDrone(r, h, aa, time) {
     let pc = 0;
     const ph = h.phase * TAU;
+    // tell² so the reignition reads as a snap rather than a slow fade — the eye
+    // should look like it is *coming back on*, not like it is dimly on the whole time.
+    const k = h.tell * h.tell;
+    const live = h.alive ? 1 : k;
+
     tint(SC0, PAL.silhouette2, 1, 1);
     r.ellipse(LAYER.SOLID, h.x, h.y, h.hw * 1.25, h.hh, 0, SC0, { soft: aa });
     pc++;
 
-    tint(SC1, PAL.magentaHot, 0.52, 1);
-    r.ring(LAYER.NEON, h.x, h.y, h.hw * 1.3, 0.1, SC1,
-      { glow: 1.0, glowRadius: 0.7, soft: aa });
+    tint(SC1, PAL.magentaHot, 0.18 + 0.92 * live, 1);
+    r.ring(LAYER.NEON, h.x, h.y, h.hw * 1.3, 0.1 + 0.05 * live, SC1,
+      { glow: 1.0 + 0.6 * live, glowRadius: 0.7, soft: aa });
     pc++;
 
-    // Scan cone: points along travel, swinging on a slow oscillation.
-    const dir = Math.atan2(h.vy, h.vx || 1e-4) + Math.sin(time * 1.6 + ph) * 0.55;
-    const cd = 5.5;
-    const cx = h.x + Math.cos(dir) * cd * 0.5;
-    const cy = h.y + Math.sin(dir) * cd * 0.5;
-    tint(SC2, PAL.magenta, 0.16, 1);
-    r.tri(LAYER.NEON, cx, cy, 2.0, cd * 0.5, dir - Math.PI * 0.5, SC2,
-      { glow: 0.5, glowRadius: 1.1, soft: aa * 3 });
-    pc++;
+    // Scan cone: points along travel, swinging on a slow oscillation. It retracts
+    // with the duty cycle, so "the beam is off" is legible from the silhouette alone.
+    if (live > 0.02) {
+      const dir = Math.atan2(h.vy, h.vx || 1e-4) + Math.sin(time * 1.6 + ph) * 0.55;
+      const cd = 5.5 * (0.35 + 0.65 * live);
+      const cx = h.x + Math.cos(dir) * cd * 0.5;
+      const cy = h.y + Math.sin(dir) * cd * 0.5;
+      tint(SC2, PAL.magenta, 0.16 * live, 1);
+      r.tri(LAYER.NEON, cx, cy, 2.0, cd * 0.5, dir - Math.PI * 0.5, SC2,
+        { glow: 0.5, glowRadius: 1.1, soft: aa * 3 });
+      pc++;
+    }
 
-    tint(SC3, PAL.hot, 0.85 + 0.35 * Math.sin(time * 6 + ph), 1);
+    tint(SC3, PAL.hot, (0.85 + 0.35 * Math.sin(time * 6 + ph)) * (0.12 + 0.88 * live), 1);
     r.circle(LAYER.NEON, h.x, h.y, 0.26, SC3, { glow: 1.0, glowRadius: 0.6, soft: aa });
     pc++;
 
-    tint(SC4, PAL.magentaHot, 0.09, 1);
+    tint(SC4, PAL.magentaHot, 0.05 + 0.30 * live, 1);
     r.glow(LAYER.FAR_GLOW, h.x, h.y, 3.6, SC4);
     pc++;
     return pc;
@@ -1801,7 +1899,10 @@ export class World {
    * The single most important read on screen. A violet ring you can find in your
    * peripheral vision, a hot core, orbiting tick marks that give it a sense of
    * mechanism, and a broad soft halo underneath so it survives the bloom pass.
-   * Heavy anchors get a second cyan ring; decaying anchors get a depleting dot arc.
+   * Heavy anchors get a second cyan ring — the ONE place cyan is allowed outside the
+   * player and the tether, because a heavy anchor is precisely a "safe thing" in the
+   * DESIGN.md sense. Decaying anchors get a depleting dot arc. A spent anchor is
+   * signalled by value, not hue: violet at 0.55x, never cyan.
    */
   _renderAnchors(r, lo, hi, aa, time, already) {
     let pc = 0;
@@ -1849,8 +1950,14 @@ export class World {
       pc++;
 
       // Main ring — the shape the eye actually locks onto, so it must stay violet
-      // rather than clipping to white. `used` shifts it to cyan as tactile feedback.
-      tint(SC2, a.used ? PAL.cyanHot : PAL.violetHot, 0.46 + 0.18 * br, 1);
+      // rather than clipping to white.
+      //
+      // `used` used to shift the ring to cyan. It cannot: cyan is the player's own
+      // hue and it also means "safe/heavy anchor" two lines below, so a spent node lit
+      // up in the same colour as the thing that is safest to grab. Spent state is now
+      // signalled with VALUE on the same hue — 0.55x brightness — which is the correct
+      // axis for "this one is used up" anyway, since hue carries the taxonomy.
+      tint(SC2, PAL.violetHot, (0.46 + 0.18 * br) * (a.used ? 0.55 : 1), 1);
       r.ring(LAYER.NEON, a.x, a.y, R, 0.16 + 0.04 * br, SC2,
         { glow: 1.0, glowRadius: R * 0.5, soft: aa });
       pc++;
@@ -1874,7 +1981,7 @@ export class World {
       // Orbiting tick marks — mechanism, and a readable rotation cue.
       const ta = time * A_TICK + ph;
       const tn = a.kind === 1 ? 4 : 3;
-      tint(SC4, a.used ? PAL.cyanHot : PAL.violetHot, 0.5 * br, 1);
+      tint(SC4, PAL.violetHot, 0.5 * br * (a.used ? 0.55 : 1), 1);
       for (let k = 0; k < tn; k++) {
         const an = ta + (k * TAU) / tn;
         const rr = R * 1.34;

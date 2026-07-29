@@ -126,8 +126,12 @@ export class Fx {
   crash(x, y, vx, vy) {
     this.burst(x, y, 60, 46, PAL.magentaHot, 3.0);
     this.burst(x, y, 26, 22, PAL.white, 3.4);
-    this.ring(x, y, 1, 22, 0.75, 0.6, PAL.magentaHot);
-    this.ring(x, y, 1, 34, 1.1, 0.25, PAL.white);
+    // Short lives on purpose. The shockwave is the biggest single moment in the game
+    // and it should SNAP — at 0.75s/1.1s the ring spent most of its life as a wide,
+    // near-transparent arc, i.e. a grey smudge crossing the frame long after the hit
+    // had registered. 0.45s/0.6s is over before the eye can start reading it as haze.
+    this.ring(x, y, 1, 22, 0.45, 0.6, PAL.magentaHot);
+    this.ring(x, y, 1, 34, 0.60, 0.25, PAL.white);
     for (let i = 0; i < 18; i++) {
       const a = rng() * TAU, s = 10 + rng() * 40;
       this.spawn(KIND.SHARD, x, y,
@@ -218,10 +222,18 @@ export class Fx {
       const t = 1 - s.life / s.maxLife;
       const e = 1 - Math.pow(1 - t, 3);          // ease out: fast expansion, slow settle
       const rad = s.r0 + (s.r1 - s.r0) * e;
-      const a = (1 - t) * (1 - t);
-      _c[0] = s.r * a * 2.2; _c[1] = s.g * a * 2.2; _c[2] = s.b * a * 2.2; _c[3] = 1;
-      r.ring(LAYER.FOREGROUND, s.x, s.y, rad, s.w * (1 - t * 0.6) + 0.02, _c,
-        { glow: 2.2, glowRadius: 2.4, soft });
+      // LINEAR fade, not squared. The radius eases outward on a cubic, so a squared
+      // fade put the ring below the bloom threshold while it was still growing — it
+      // spent two thirds of its life as a wide desaturated arc. Linear × a higher
+      // gain keeps it emissive right up to the point it vanishes.
+      const a = 1 - t;
+      const k = a * 4.0;
+      _c[0] = s.r * k; _c[1] = s.g * k; _c[2] = s.b * k; _c[3] = 1;
+      // Halo scales with the core it belongs to. A fixed 2.4 against a 0.12-wide core
+      // made the halo 20x the shape, which is the definition of a smudge.
+      const th = s.w * (1 - t * 0.6) + 0.02;
+      r.ring(LAYER.FOREGROUND, s.x, s.y, rad, th, _c,
+        { glow: 2.2, glowRadius: th * 3.5, soft });
     }
   }
 }
