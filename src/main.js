@@ -16,6 +16,39 @@ import { Screens } from './ui/screens.js';
 
 const STATE = { TITLE: 0, PLAY: 1, DYING: 2, DEAD: 3 };
 
+// ---------------------------------------------------------------------------------
+// COMBO LADDER
+//
+// The multiplier used to be a flat division — `1 + floor(combo / COMBO_PER_STEP)` —
+// which made every step cost the same. It should not. See CFG.COMBO_EARLY_STEP: the
+// multiplier is the only mid-run signal that a run is going well, and at a flat 5 it
+// was unreachable for the tier that needs it most (the `hold` bot spends 84% of its
+// run at ×1, where the badge does not even render).
+//
+// The two functions are exact inverses and MUST stay so. The decay path steps the
+// multiplier down and then rewrites `combo` to the floor of the new tier; if that
+// floor disagreed with the ladder by even one event, a player could sit on a boundary
+// and flicker a tier every window.
+//
+// NOTE: sim2.mjs mirrors both. Change these, change those.
+const CB_E = () => CFG.COMBO_EARLY_STEP ?? CFG.COMBO_PER_STEP;
+const CB_N = () => CFG.COMBO_EARLY_N ?? 0;
+
+/** Multiplier for a combo count. */
+function multForCombo(c) {
+  const e = CB_E(), n = CB_N(), s = CFG.COMBO_PER_STEP, knee = n * e;
+  const m = c < knee ? 1 + Math.floor(c / e)
+                     : 1 + n + Math.floor((c - knee) / s);
+  return clamp(m, 1, CFG.COMBO_MAX_MULT);
+}
+
+/** Fewest combo events that reach a multiplier — the inverse of multForCombo. */
+function comboForMult(m) {
+  const e = CB_E(), n = CB_N(), s = CFG.COMBO_PER_STEP;
+  if (m <= 1) return 0;
+  return m - 1 <= n ? (m - 1) * e : n * e + (m - 1 - n) * s;
+}
+
 class Game {
   constructor() {
     this.canvas = document.getElementById('gl');
@@ -66,14 +99,20 @@ class Game {
     this.multiplier = 1;
     this.multiplierPeak = 1;
     this.perfects = 0;
+    this.hazardGrazes = 0;
+    /** Overdrives triggered this run — reported by name in the RUN REPORT. */
+    this.overdrives = 0;
     this.charge = 0;
     this.overdrive = 0;
     this.overdriveActive = false;
     this.chargeFull = false;      // meter banked, waiting on an arc to spend it
+    this.chargeFullT = 0;         // ...and how long it has been waiting
     this.startX = 0;
 
-    this.best = Number(localStorage.getItem('arclight.best') || 0);
-    this.bestDistance = Number(localStorage.getItem('arclight.bestDistance') || 0);
+    // `.s2` is the economy epoch — see the note on LS_BEST in screens.js. Bump both
+    // files together whenever a rebalance changes what a point is worth.
+    this.best = Number(localStorage.getItem('arclight.best.s2') || 0);
+    this.bestDistance = Number(localStorage.getItem('arclight.bestDistance.s2') || 0);
 
     // ---- camera ------------------------------------------------------------
     this.camX = 0; this.camY = 0;
@@ -86,6 +125,10 @@ class Game {
     // Must exist before the first updateCamera() — a NaN here propagates into zoom
     // through damp() and never recovers, which renders the entire scene invisible.
     this.speed01 = 0;
+    /** 0..1 proximity to the floodline over FLOOD_WARN_BAND. Drives both the danger
+     *  vignette and the water-surface alarm in world.render — one number so the two
+     *  halves of the drowning telegraph can never drift apart. */
+    this.flood01 = 0;
 
     // ---- feel --------------------------------------------------------------
     this.hitstop = 0;
@@ -110,8 +153,8 @@ class Game {
     };
     this.hudState = {
       distance: 0, score: 0, multiplier: 1, charge01: 0,
-      overdrive01: 0, alive: true, speed01: 0, menu: true, holding: false,
-      chargeFull: false, perfectCue: 0,
+      overdrive01: 0, odExit: false, alive: true, speed01: 0, menu: true,
+      holding: false, chargeFull: false, perfectCue: 0,
     };
 
     this.events = makeEventSink(this);
@@ -211,8 +254,9 @@ class Game {
     this.distance = 0; this.score = 0;
     this.combo = 0; this.comboTimer = 0;
     this.multiplier = 1; this.multiplierPeak = 1; this.perfects = 0;
+    this.hazardGrazes = 0; this.overdrives = 0;
     this.charge = 0; this.overdrive = 0; this.overdriveActive = false;
-    this.chargeFull = false; this.player.invuln = false;
+    this.chargeFull = false; this.chargeFullT = 0; this.player.invuln = false;
     this.trauma = 0; this.flash = 0; this.hitstop = 0;
     this.runTime = 0; this.deathTimer = 0;
     this.timescale = 1;
@@ -252,11 +296,11 @@ class Game {
     const isNewBest = this.score > this.best;
     if (isNewBest) {
       this.best = this.score;
-      localStorage.setItem('arclight.best', String(this.best));
+      localStorage.setItem('arclight.best.s2', String(this.best));
     }
     if (dist > this.bestDistance) {
       this.bestDistance = dist;
-      localStorage.setItem('arclight.bestDistance', String(dist));
+      localStorage.setItem('arclight.bestDistance.s2', String(dist));
     }
     this.screens.showGameOver({
       distance: dist,
@@ -265,6 +309,8 @@ class Game {
       bestDistance: this.bestDistance,
       multiplierPeak: this.multiplierPeak,
       perfects: this.perfects,
+      hazardGrazes: this.hazardGrazes,
+      overdrives: this.overdrives,
       isNewBest,
     });
   }
@@ -278,7 +324,7 @@ class Game {
   bumpCombo() {
     this.combo++;
     this.comboTimer = CFG.COMBO_WINDOW;
-    const m = clamp(1 + Math.floor(this.combo / CFG.COMBO_PER_STEP), 1, CFG.COMBO_MAX_MULT);
+    const m = multForCombo(this.combo);
     if (m > this.multiplier) {
       this.multiplier = m;
       if (m > this.multiplierPeak) this.multiplierPeak = m;
@@ -297,6 +343,7 @@ class Game {
     this.charge = clamp01(this.charge + amount);
     if (this.charge >= 1 && !this.chargeFull) {
       this.chargeFull = true;
+      this.chargeFullT = 0;
       this.hud.popup('combo', 'OVERDRIVE READY', this.cssW * 0.5, this.cssH * 0.42);
       vibrate(14);
     }
@@ -304,7 +351,9 @@ class Game {
 
   startOverdrive() {
     this.overdriveActive = true;
+    this.overdrives++;
     this.chargeFull = false;
+    this.chargeFullT = 0;
     this.overdrive = CFG.OVERDRIVE_DURATION;
     this.charge = 1;
     this.player.invuln = true;          // DESIGN.md's promised invulnerability
@@ -318,13 +367,15 @@ class Game {
     vibrate(30);
   }
 
-  endOverdrive(refund) {
+  /** `refund01` is 0 (expired / died) or a fraction of OVERDRIVE_REFUND (exit arc). */
+  endOverdrive(refund01) {
     if (!this.overdriveActive) return;
     this.overdriveActive = false;
     this.overdrive = 0;
     this.player.invuln = false;
-    this.charge = refund ? CFG.OVERDRIVE_REFUND : 0;
+    this.charge = refund01 > 0 ? CFG.OVERDRIVE_REFUND * refund01 : 0;
     this.chargeFull = false;
+    this.chargeFullT = 0;
     this.audio.overdriveEnd();
   }
 
@@ -345,7 +396,10 @@ class Game {
     let rawDt = (now - this.lastT) / 1000;
     this.lastT = now;
     if (!(rawDt > 0)) rawDt = 1 / 60;
-    rawDt = Math.min(rawDt, 1 / 20);        // never simulate more than a 20fps step
+    // Never simulate more than a 20fps step. The player's substep budget is sized to
+    // exactly this number (config.js: MAX_SIM_DT) — if they diverge, the player and
+    // the hazards advance by different amounts of time on slow frames.
+    rawDt = Math.min(rawDt, CFG.MAX_SIM_DT);
 
     this.frameMs = lerp(this.frameMs, (now - (this._prevNow || now)) || 16.7, 0.08);
     this._prevNow = now;
@@ -422,7 +476,7 @@ class Game {
         if (this.comboTimer <= 0) {
           if (this.multiplier > 1) {
             this.multiplier--;
-            this.combo = (this.multiplier - 1) * CFG.COMBO_PER_STEP;
+            this.combo = comboForMult(this.multiplier);
             this.comboTimer = CFG.COMBO_WINDOW;   // one more window at the lower tier
             // Losing a tier was previously silent in all three channels. The HUD
             // collapse fires off the multiplier drop; these are the other two.
@@ -436,7 +490,13 @@ class Game {
       if (this.overdriveActive) {
         this.overdrive -= dt;
         this.charge = clamp01(this.overdrive / CFG.OVERDRIVE_DURATION);
-        if (this.overdrive <= 0) this.endOverdrive(false);
+        if (this.overdrive <= 0) this.endOverdrive(0);
+      } else if (this.chargeFull) {
+        // A full meter waits for you to spend it on an arc — but only for so long.
+        // Without this floor a player who cannot reliably score arcs never sees
+        // overdrive at all, however much charge they earn. See OVERDRIVE_ARM_TIMEOUT.
+        this.chargeFullT += dt;
+        if (this.chargeFullT >= CFG.OVERDRIVE_ARM_TIMEOUT) this.startOverdrive();
       }
       this.fx.speedDust(p.x, p.y, p.vx, p.vy, this.speed01, dt);
     } else if (this.state === STATE.DYING) {
@@ -488,14 +548,29 @@ class Game {
     ps.aberration = 0.55 + this.speed01 * 1.1 + this.trauma * 1.6;
     ps.vignette = 1 - overdrive01 * 0.35;
     ps.flash = this.flash;
-    // Danger vignette. Kept deliberately tight and eased: the player legitimately
-    // spends time low in the corridor (the catch row sits ~20-34 below the chain), and
-    // a wide linear ramp tinted the whole frame maroon for most of a normal run.
-    // Squaring it means it stays invisible until the floodline is genuinely a threat.
-    const fall = clamp01(remap(p.y, CFG.FLOODLINE - 13, CFG.FLOODLINE, 0, 1));
+    // Danger vignette — the drowning telegraph.
+    //
+    // This used to ramp over 13 world units and then SQUARE the result, on the
+    // reasoning that the player legitimately spends time low in the corridor (the
+    // catch row sits ~20-34 below the chain) and a wide linear ramp would tint the
+    // whole frame maroon for most of a normal run. That reasoning was right about the
+    // problem and wrong about the fix: at the measured 76 m/s descent of a real
+    // drowning, 13 units squared is 0.17 SECONDS of warning, against the 250ms
+    // reaction floor this project sets for itself in PERFECT_ETA_LEAD. The one lethal
+    // thing with no telegraph was also the mid tier's biggest killer.
+    //
+    // The band is now FLOOD_WARN_BAND (55u ~= 0.72s, the same lead a laser gets), and
+    // the "don't paint the whole frame" requirement is met by SHAPE instead of by
+    // width: a cubic ease keeps the first two thirds of the band near-invisible, so
+    // cruising the catch row still costs nothing, while the last stretch comes up far
+    // harder and far earlier than the old squared 13u ever did. Measured at the
+    // fatal descent rate: first perceptible tint (0.05) at 0.42s to impact where it
+    // used to be 0.14s, and full intensity 3x further out.
+    const fall = clamp01(remap(p.y, CFG.FLOODLINE - CFG.FLOOD_WARN_BAND, CFG.FLOODLINE, 0, 1));
+    this.flood01 = fall;
     ps.damage01 = this.state === STATE.DYING
       ? clamp01(this.deathTimer * 2)
-      : fall * fall * 0.7;
+      : fall * fall * fall * 0.8;
     ps.exposure = (1 + overdrive01 * 0.28) / this.emissiveScale;
 
     const as = this.audioState;
@@ -516,6 +591,13 @@ class Game {
     hs.multiplier = this.multiplier;
     hs.charge01 = this.charge;
     hs.overdrive01 = overdrive01;
+    // The exit window, in RAW seconds — the HUD must not have to reverse-engineer it
+    // out of the remapped overdrive01, or the cue and the mechanic can drift apart.
+    hs.odExit = this.overdriveActive && this.overdrive <= CFG.OVERDRIVE_EXIT_WINDOW;
+    // The avatar's arc cue beats on this same boolean, from this same line, so the
+    // on-body signal and the HUD rim are the same fact rather than two derivations of
+    // it. Render-only: nothing in player physics reads it.
+    this.player.odExit = hs.odExit;
     hs.alive = this.state === STATE.PLAY;
     hs.speed01 = this.speed01;
     hs.menu = as.menu;                 // TITLE | DEAD — hides the HUD on menus
@@ -582,7 +664,10 @@ class Game {
     const viewWorldH = this.viewH / this.zoom;
 
     this.backdrop.render(r, camX, camY, viewWorldW, viewWorldH, this.zoom);
-    this.world.render(r, camX, viewWorldW, this.zoom, this.time);
+    // flood01 is passed in rather than recomputed: the water alarm and the danger
+    // vignette are one telegraph in two channels and must share one input.
+    this.world.render(r, camX, viewWorldW, this.zoom, this.time,
+      this.state === STATE.PLAY ? this.flood01 : 0);
     if (this.state !== STATE.DEAD || this.player.alive) this.player.render(r, this.time);
     this.fx.render(r, this.zoom);
 
@@ -615,12 +700,24 @@ function makeEventSink(g) {
       // CENTRE worth 4x the edge and gives L2 somewhere to go.
       const qq = quality * quality;
       g.addScore(CFG.SCORE_PERFECT * (0.35 + qq * 1.15));
-      // THE L5 SPEND. Banked charge is cashed on an arc; an arc taken *during*
-      // overdrive is the exit ramp and refunds OVERDRIVE_REFUND. `endOverdrive(true)`
-      // was unreachable dead code until this branch existed. The 1.0s floor stops the
-      // arc that fired overdrive from cancelling it a moment later.
+      // THE L5 SPEND. Banked charge is cashed on an arc. An arc taken *during*
+      // overdrive used to end it outright, which made the showpiece cancel itself for
+      // playing well: measured median lived duration 1.4s against a nominal 6s, and
+      // WORSE the better the player. Arcs inside overdrive are now free — they score
+      // (doubled) and nothing else — until the last OVERDRIVE_EXIT_WINDOW seconds,
+      // where an arc becomes the deliberate exit and banks a refund that scales with
+      // how late you cut it. Miss the window and overdrive just expires, unrefunded.
+      // The skill moved from "don't play well" to "time your exit", which is what L5
+      // was supposed to be.
       if (g.overdriveActive) {
-        if (g.overdrive < CFG.OVERDRIVE_DURATION - 1.0) g.endOverdrive(true);
+        const win = CFG.OVERDRIVE_EXIT_WINDOW;
+        if (g.overdrive <= win) {
+          const late = clamp01(1 - g.overdrive / win);
+          const f = CFG.OVERDRIVE_REFUND_FLOOR;
+          g.endOverdrive(f + (1 - f) * late);
+          g.hud.popup('combo', 'CLEAN EXIT',
+            g.worldToScreenX(x), g.worldToScreenY(y) - 158);
+        }
       } else if (g.chargeFull) {
         g.startOverdrive();
       } else {
@@ -644,18 +741,33 @@ function makeEventSink(g) {
       vibrate(quality > 0.75 ? 18 : 10);
     },
     graze(x, y, obj, isHazard) {
-      // Risk = reward. A hazard graze is the only one that could have killed you, so
-      // it pays 4.5x, charges 6x, and is the only one that BUMPS the combo — skimming
-      // architecture merely holds the chain open. Grazes now fire ~26x/run (was 2.0);
-      // if every one bumped the combo the multiplier would pin at the cap again.
+      // RISK = REWARD, and the feedback has to say so.
+      //
+      // Grazing used to fire ~30x a run, of which 94% were ANCHORS — the things you are
+      // actively aiming at, which carry no risk whatever. The two genuinely dangerous
+      // grazes per run were buried in that noise, and because each popup moved the
+      // charge bar by an invisible 1.3%, the HUD's frequency implied an importance the
+      // magnitude never delivered. Anchors are no longer grazable at all (see
+      // CFG.GRAZE_ANCHORS), so this now fires ~3x a run and ~80% of those are hazards:
+      // frequency and magnitude finally agree.
+      //
+      // A hazard graze is the only reward in the game you can only collect by being
+      // close enough to die, so it is the loudest non-arc event on screen: 4.5x the
+      // score, 5.5x the charge (a visible 11% of the bar in one deposit), a combo bump,
+      // a flash, and the large amber popup. Architecture grazes are real risk too — the
+      // deck you skimmed could have killed you — but they are the quiet cousin.
       g.addScore(isHazard ? CFG.SCORE_GRAZE_HAZARD : CFG.SCORE_GRAZE);
       g.addCharge(isHazard ? CFG.GRAZE_CHARGE_HAZARD : CFG.GRAZE_CHARGE);
-      if (isHazard) g.bumpCombo(); else g.comboTimer = CFG.COMBO_WINDOW;
+      if (isHazard) { g.bumpCombo(); g.hazardGrazes++; }
+      else g.comboTimer = CFG.COMBO_WINDOW;
       g.fx.graze(x, y, g.player.x - x, g.player.y - y);
-      g.trauma = Math.max(g.trauma, CFG.TRAUMA_GRAZE);
+      g.trauma = Math.max(g.trauma, isHazard ? CFG.TRAUMA_GRAZE * 1.8 : CFG.TRAUMA_GRAZE);
+      if (isHazard) g.flash = Math.max(g.flash, 0.16);
       g.audio.graze();
-      vibrate(4);
-      g.hud.popup('graze', isHazard ? 'HAZARD GRAZE' : 'GRAZE',
+      vibrate(isHazard ? 14 : 4);
+      // 'combo' is the big amber popup kind; 'graze' is the small one. Reusing the
+      // existing kinds keeps this a pure gameplay change — ui.css is untouched.
+      g.hud.popup(isHazard ? 'combo' : 'graze', isHazard ? 'HAZARD GRAZE' : 'GRAZE',
         g.worldToScreenX(x), g.worldToScreenY(y));
     },
     deflect(x, y, obj) {
@@ -668,9 +780,7 @@ function makeEventSink(g) {
     },
     orb(x, y) {
       g.addScore(CFG.SCORE_ORB);
-      // Rebudgeted with the rest of the charge economy: overdrive was active 45% of
-      // the time, closer to a default state than an event. Target is ~1 per 25-30s.
-      g.addCharge(0.016);
+      g.addCharge(CFG.ORB_CHARGE);
       g.bumpCombo();
       g.fx.orb(x, y);
       g.audio.orb();

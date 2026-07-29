@@ -112,10 +112,28 @@ const BAND_BLOBS    = Int32Array.of(1, 1, 1, 1, 2, 1);
 /**
  * Emissive gain per band. City light lands on LAYER.SOLID at alpha 1, so the
  * authored value IS the on-screen value — no transmission arithmetic any more.
- * The useful window is roughly 1.2 (just blooms) to 3.5 (blooms hard but keeps its
- * hue). Past ~4 the ACES curve in post pulls every channel to white and saturated
- * neon turns into grey mush, which is the single easiest way to make this scene
- * look cheap. Far bands are dimmer so aerial perspective survives.
+ *
+ * THE CEILING HERE USED TO BE WRONG, and it was wrong in both directions at once.
+ * It read "past ~4 the ACES curve in post pulls every channel to white and saturated
+ * neon turns into grey mush". That was written against a per-channel tonemap that no
+ * longer exists. post.js has been hue-preserving (max-channel normalisation) for some
+ * time, which means it CANNOT rotate a hue and cannot mush anything to grey — but it
+ * also had no highlight response at all, so past ~2 authored it did not do anything
+ * whatsoever and every value in this table above that was a no-op.
+ *
+ * Both are now false. The tonemap has a highlight knee at m = 9..60 measured AFTER
+ * the post grade (black point, gain, CONTRAST 1.15), so the authored value that first
+ * reaches it is about 8.0 and the one that fully bleaches is about 30. Mapped:
+ *     authored 1.2 -> 1.30    3.5 -> 4.49    8.0 -> 11.7 (knee 0.01)
+ *     authored 3.0 -> 3.76    5.0 -> 6.78   14.0 -> 22.2 (knee 0.17)
+ * So the real window is 1.2 (just crosses the 1.0 bloom threshold) to about 6.0, and
+ * the whole 1.35-2.00 table below sits an order of magnitude clear of the knee: NO
+ * signage in the city bleaches, and none of these numbers needed to change. What is
+ * different is that they now *could* go higher — up to ~6 — without losing chroma,
+ * and above that they would bleach hue-exactly toward white rather than to mush. That
+ * headroom is deliberately left unspent: the ceiling on this table is the black point
+ * (see the note on the near band below), not the tonemap.
+ * Far bands are dimmer so aerial perspective survives.
  *
  * THE FLOOR MATTERS AS MUCH AS THE CEILING. Signs are tinted from NEON_SET, which is
  * built from the LDR palette entries (peak <= 1.0, not the *Hot variants at 2.6–3.0).
@@ -749,8 +767,12 @@ export class Backdrop {
   // bloom generated from a genuinely bright pixel behaves like light, whereas a
   // baked halo behind an opaque wall behaves like a sticker.
   //
-  // Values are authored in the 1.2–3.5 band. Above ~4 the ACES curve pulls
-  // everything to white and the neon goes grey — the desaturation trap.
+  // Values are authored in the 1.2–3.5 band. The old note here claimed that above ~4
+  // "the ACES curve pulls everything to white and the neon goes grey"; that has not
+  // been true since the tonemap became hue-preserving, and the real ceiling is now the
+  // highlight knee, which an authored sign value does not reach until ~8. See the
+  // BAND_EMIT block for the mapping. The band stays where it is on black-point
+  // grounds, not chroma ones.
   //
   // Flicker model: ~80% of signs breathe slowly (a sine plus a low-amplitude noise
   // wander); ~20% are failing tubes that stutter hard on a thresholded noise, with

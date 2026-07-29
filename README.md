@@ -63,6 +63,7 @@ contain a magic number or a colour.
 ```
 node tools/probe.mjs --out shots/x       # headless iPhone playthrough + screenshots
 node tools/dev/sim2.mjs                  # headless gameplay sim, 30 seeds, 3 bots
+node tools/dev/platform.mjs [t4,t6]      # iPhone-Safari platform acceptance, 10 checks
 node tools/dev/analyze.mjs <png...>      # luminance/saturation/black-point analysis
 node tools/dev/audio.mjs                 # WebAudio graph + signal verification
 ```
@@ -73,7 +74,24 @@ it is checked explicitly.
 
 `sim2.mjs` is the gameplay acceptance test. It runs three bots — `smart` (aims for the
 perfect-arc window), `metronome` (fixed rhythm), and `hold` (never releases, the
-worst-case new player) — and classifies how every run ends.
+worst-case new player) — and classifies how every run ends. The load-bearing assertion
+is that `smart` beats `hold` by a wide margin: if it doesn't, skill has stopped paying
+and the game is broken however good it looks.
+
+Two things about running it. **Use a lot of seeds.** The default 30 is for a quick look;
+anything load-bearing wants 360+, because the targeting assist makes the whole system
+chaotic — a three-unit change to `TETHER_FLOOD_PANIC` reshuffles every trajectory, and
+sweeps of it are non-monotonic well past 90 seeds. A 90-seed result that looks like a
+clean 2× win routinely evaporates at 360. **And read both L1 assertions.** `hold` cannot
+drown (it never releases), so it cannot police the failure mode that was the mid tier's
+biggest killer; `metronome` carries a separate budgeted tripwire on early drownings for
+exactly that reason.
+
+`platform.mjs` covers the things only a real device punishes you for — context loss on
+backgrounding, audio dying after a phone call, safe-area insets in both orientations,
+Home Screen install metadata, multi-touch. Every check runs in its own browser behind a
+hard deadline, so the suite always terminates and always prints a summary; it exits
+non-zero if anything needs attention.
 
 ## Browser support
 

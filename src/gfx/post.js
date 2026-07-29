@@ -93,6 +93,24 @@ const TUNE = {
   SAT_RECOVER: 0.75,
   VIBRANCE: 1.30,        // post-tonemap chroma expansion around luma
 
+  // ---- overdrive grade -------------------------------------------------------
+  // White-point shift toward the palette's white-hot #eaffff. Applied to the
+  // ACHROMATIC part of the pixel only (see the composite), so it warms the frame
+  // without rotating a saturated hue. The previous form was a flat channel multiply
+  // of (0.70, 1.14, 1.30) which took 30% out of RED — it turned every violet anchor
+  // and every magenta hazard toward green-cyan, i.e. it deleted the two colours the
+  // player most needs to tell apart, in the exact six seconds they are flying at
+  // hazards on purpose.
+  OD_TINT: [0.92, 1.01, 1.05],
+  OD_SAT: 0.50,          // chroma gain at od = 1
+  // Contrast as a GAMMA, not as a pivot-and-slope. The old form,
+  // clamp((col - 0.22) * 1.55 + 0.22), has a zero crossing at 0.078 linear — every
+  // pixel below sRGB 80 went to absolute black, which is the entire city silhouette
+  // band. A gamma has no zero crossing: shadows deepen asymptotically and structure
+  // survives. sRGB 80 -> 61 at od = 1 instead of -> 0.
+  OD_CONTRAST: 0.26,
+  OD_LIFT: 1.10,         // gain that puts the highlights back after the gamma
+
   // Radial chromatic aberration, uv units at the corners. At 0.0075 the R/B split
   // measured 8.8 device px at the frame edge at cruise and 16.7 px on a crash — full
   // rainbow fringing on every rain streak and every small primitive, which reads as
@@ -295,8 +313,11 @@ vec3 acesFilm(vec3 x) {
   const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
+float acesScalar(float x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
 
-// Hue-preserving tonemap.
+// Hue-preserving tonemap. THE HIGHLIGHT HUE POLICY LIVES HERE.
 //
 // Per-channel ACES desaturates by design: it maps each channel independently, so a
 // 3.0-intensity cyan (0.4, 3.0, 3.2) comes out (0.54, 0.95, 0.96) — 44% saturation,
@@ -304,16 +325,81 @@ vec3 acesFilm(vec3 x) {
 // and it is why overdrive measured at 0.13 saturation: everything bright had stopped
 // being a colour at all.
 //
-// The fix is to spend the tonemapper on LUMINANCE only and re-apply the original
-// chroma ratio at the new luminance. That same cyan becomes (0.14, 1.0, 1.0) — still
-// a bright core, but unmistakably cyan. Blending the two (u_satRecover) keeps a little
-// of the per-channel roll-off so the very hottest cores still bloom toward white
-// rather than turning into flat colour chips.
+// So the tonemapper is spent on BRIGHTNESS only and the original chroma ratio is
+// re-applied. The load-bearing detail is WHICH brightness. The first version of this
+// used luminance — scale c by lPost/lPre, then clamp — and that clamp was silently
+// doing all the work at the top end, because it is the one gamut operation that
+// CHANGES HUE. violetHot (1.55, 1.00, 2.80) carries its luma in G, which is its
+// DARKEST channel: lPre = 1.247, so at lPost ~ 1.0 the "hue-safe" result is
+// (1.24, 0.80, 2.25) and the clamp lands it on (1.00, 0.80, 1.00). R == B is hue
+// exactly 300°, the magenta primary — and magentaHot clamped onto the same 300°.
+// Measured through this shader before the fix (palette swatch rig, peak emission):
+// violetHot 300.0°/sat 0.148, magentaHot 300.0°/sat 0.423. Two objects the palette
+// places 75° apart arrived 0.0° apart, so at peak brightness "grab this" and "this
+// kills you" were the same colour.
+//
+// Normalising by the MAX CHANNEL is in-gamut by construction (every channel is <= m,
+// so every channel lands <= acesScalar(m) <= 1) and therefore never needs a clamp.
+// The channel ratios — hue and saturation both — survive exactly, and only VALUE is
+// tonemapped. It is also the honest answer to "why can a hot core not be saturated":
+// you cannot have a saturated violet at luminance 1.0, so we hold value at 1.0 and
+// let luminance be whatever that hue permits. The core reads violet; the bloom halo
+// around it, which is a sum over many colours, is what carries the white heat.
+//
+// Measured after, same rig: violetHot 265.5°/sat 0.329, magentaHot 320.0°/sat 0.532
+// — 54.5° apart. And measured where it actually matters, by sampling the most
+// CHROMATIC lit pixel of every anchor and hazard on screen across a real run (the
+// brightest pixel of a neon object is its white core, which is white on purpose):
+//     anchors  hue 276.9° -> 260.0° median, sat 0.27 -> 0.39
+//     hazards  hue 300.0° -> 318.0° median, sat 0.75 -> 0.77
+//     median separation 23° -> 58°
+// The load-bearing number is the anchor p90: it was 300.0°, i.e. the top decile of
+// anchors by brightness had collapsed exactly onto the magenta primary. It is now
+// 268.2°. Nothing in the frame lands on 300° by accident any more.
+//
+// u_satRecover is the blend against plain per-channel ACES. It is NOT 1.0 on purpose:
+// keeping ~25% of the per-channel roll-off leaves a real path to white for the very
+// hottest cores, so a 30.0-emission impact still whites out instead of turning into a
+// saturated colour chip.
+//
+// ---- THE HIGHLIGHT KNEE, and why the normalisation alone is not a tonemap --------
+// Max-channel normalisation is hue-exact, but it is also SCALE-INVARIANT at the top.
+// hueSafe = c * acesScalar(m)/m, and acesScalar(m) -> 1 as m grows, so hueSafe -> c/m
+// — the unit chroma vector. That vector does not depend on how much light there is.
+// Measured through this exact expression on violetHot (1.55, 1.00, 2.80):
+//     k =  1  ->  0.5249  0.3386  0.9481
+//     k =  3  ->  0.5536  0.3571  1.0000
+//     k = 40  ->  0.5536  0.3571  1.0000
+// From k=3 to k=40 — 13x the light — the output was BYTE-IDENTICAL. The palette is
+// authored at 2.6–3.0 and typical draw multipliers are x1–x5, so the entire game was
+// living on the flat part of the curve: an anchor, an impact core and a laser at ten
+// times the emission all resolved to the same three bytes. That is why the frame read
+// as flat coloured discs, and it made DESIGN.md's first rule ("every emissive element
+// has a dimmer core-to-edge falloff") mathematically unsatisfiable above emission ~2.
+//
+// The fix is a second gamut destination reached by VALUE, not by hue: white. White is
+// the one place a colour can go without rotating, so blending toward vec3(acesScalar(m))
+// adds a highlight response while leaving hue exactly where it was on the way up. The
+// knee is a smoothstep on m so it costs nothing below it. Measured after, hue held to
+// the degree while luminance ramps and saturation rolls off:
+//     violetHot   x1 L182 h266 s0.34 -> x4 L205 h264 s0.23 -> x8 L251 h264 -> x14 white
+//     magentaHot  x1 L149 h320 s0.56 -> x4 L195 h325 s0.31 -> x8 L253 h320 -> x14 white
+//     cyanHot     x1 L197 h183 s0.91 -> x4 L229 h184 s0.39 -> x8 L254 h180 -> x14 white
+// (tools/dev/.tonemap.mjs is the model those came from and reproduces both curves.)
+//
+// NOTE WHICH m THIS IS. It is measured after the black point, gain, CONTRAST and
+// exposure, and after bloom has been added — not on the authored palette value. A bare
+// 3.0 palette entry arrives here at ~3.8, comfortably under KNEE0, so nothing that is
+// merely "a lit object" bleaches. Things that stack — an emissive drawn at x3 of an
+// already-3.0 palette colour, overlapping halos, impact cores — do. That is the
+// intent: overlap is supposed to be visible, and before this it was not.
+const float KNEE0 = 9.0;    // below this, hue-exact normalisation, unchanged behaviour
+const float KNEE1 = 60.0;   // at this, fully bleached to white
 vec3 tonemap(vec3 c) {
   vec3 tm = acesFilm(c);
-  float lPre = max(dot(c, LUMA), 0.00001);
-  float lPost = dot(tm, LUMA);
-  vec3 hueSafe = clamp(c * (lPost / lPre), 0.0, 1.0);
+  float m = max(max(c.r, c.g), max(c.b, 0.00001));
+  vec3 hueSafe = c * (acesScalar(m) / m);
+  hueSafe = mix(hueSafe, vec3(acesScalar(m)), smoothstep(KNEE0, KNEE1, m));
   return mix(tm, hueSafe, u_satRecover);
 }
 
@@ -433,6 +519,40 @@ void main() {
   float bleach = max(fl - 0.35, 0.0);
   col *= max(u_exposure, 0.0) * (1.0 + fl * 2.0 + fl * fl * 7.0);
   col += vec3(0.92, 0.98, 1.00) * bleach * bleach * 5.0;
+
+  // --- damage vignette (blood in the lens) ---------------------------------------
+  // Also in front of the tonemap, and for exactly the reason written above. This used
+  // to sit 40 lines further down as a post-tonemap additive of up to 0.85 — the
+  // identical pedestal mistake the flash path was rewritten to avoid. Measured: a
+  // death frame went from 64.9% true black to 11.2%, the whole screen became one flat
+  // magenta card, and the HUD was unreadable for the full 1.15s of the death.
+  //
+  // Rebuilt as light, in three parts, only the last of which can add energy:
+  //   OCCLUSION is a straight multiply. Blood on glass absorbs; a multiply cannot
+  //   lift a black pixel, ever, however hard it is driven.
+  //   ARTERIAL SHIFT is also a multiply — it re-weights what light does get through
+  //   toward red, so the neon at the frame edge turns blood-coloured instead of being
+  //   covered by a pink sheet. This is the part that reads as "in the lens".
+  //   RIM is the only additive term. It is quadratic in edge and tiny (0.09), so a
+  //   genuinely black corner still shows a faint glow, and it is in front of ACES —
+  //   which compresses it 3.5:1 — rather than behind it where it would land raw on
+  //   the gamma encode.
+  //
+  // Measured on the death frame at damage01 = 1.0, against a cruise frame that sits at
+  // 58-64% true black:  true black 10.6% -> 57.5%,  mean luma 85.5 -> 49.5. The death
+  // no longer moves the black point out of its normal gameplay range at all.
+  float dmg = clamp(u_damage01, 0.0, 1.0);
+  if (dmg > 0.001) {
+    float throb = 0.62 + 0.38 * sin(u_time * 8.5);
+    // 0.40, not 0.30: in a portrait frame rn is only 0.71 at the top-centre, so a ramp
+    // starting at 0.30 already had the HUD at 56% strength — the readout went maroon
+    // before the corners did.
+    float edge = smoothstep(0.40, 1.10, rn) * dmg;
+    col *= 1.0 - edge * 0.55 * throb;
+    col *= mix(vec3(1.0), vec3(2.40, 0.28, 0.62), edge * 0.85);
+    col += vec3(1.0, 0.05, 0.22) * (edge * edge * throb * 0.09);
+  }
+
   col = tonemap(col);
 
   // --- vibrance ------------------------------------------------------------------
@@ -447,32 +567,50 @@ void main() {
   // --- overdrive grade -----------------------------------------------------------
   // A GRADE, not an exposure push. The old version multiplied exposure, lifted bloom
   // 2.1x and then bleached toward white — which is exactly how you get a 141-luma,
-  // 0.13-saturation white-out with zero black pixels. Instead: bias the channels
-  // toward the palette's white-hot #eaffff, RAISE contrast (so the blacks get blacker
-  // while the highlights get hotter), and push saturation UP.
+  // 0.13-saturation white-out with zero black pixels.
+  //
+  // The version after THAT swung the other way and deleted the city. Three separate
+  // faults, all measured through this shader on a live overdrive frame:
+  //   - a (0.70, 1.14, 1.30) channel multiply: -30% red, so violet anchors and
+  //     magenta hazards both rotated toward green-cyan;
+  //   - clamp((col - 0.22) * 1.55 + 0.22), whose zero crossing sits at 0.078 linear
+  //     (~sRGB 80): the whole city silhouette band crushed to absolute black, and
+  //     true-black went UP from 68% to 78% — the frame did not get punchier, it lost
+  //     its subject;
+  //   - a saturation boost applied AFTER that clamp, i.e. to pixels whose chroma the
+  //     clamp had already thrown away. Measured whole-frame saturation went
+  //     0.752 (cruise) -> 0.275 (overdrive). The comment here used to claim
+  //     "saturation goes UP". It went down by 63%.
+  //
+  // ORDER IS THE FIX, and so is choosing operators that cannot clip:
+  //   1. gamma contrast — no zero crossing, so silhouettes deepen instead of dying;
+  //   2. chroma gain and white-point tint SECOND, on a signal that still has chroma;
+  //   3. a hue-exact gamut scale rather than a clamp, at the end.
+  // The tint is applied to the ACHROMATIC component only. A flat channel multiply
+  // rotates every hue in the frame; separating luma from chroma warms the white point
+  // toward #eaffff while leaving the chroma VECTOR — the hue — untouched.
+  //
+  // Measured on live overdrive frames, cruise in brackets for reference:
+  //   whole-frame saturation  0.275 -> 0.788   [cruise 0.73-0.75]
+  //   true black              77.8% -> 54.2%   [cruise 58-64%]   the city is back
+  //   mean luma                30.8 -> 47.0    [cruise 34-37]     and it is hotter
+  //   violetHot at peak     222°/0.04 -> 264°/0.49
+  //   magentaHot at peak    299°/0.35 -> 318°/0.77
+  // Violet at saturation 0.04 had no hue to speak of; it does now, and it is violet.
   if (od > 0.001) {
-    col *= mix(vec3(1.0), vec3(0.70, 1.14, 1.30), od);
-    // Contrast about a LOW pivot (0.22, not 0.40). Pivoting near mid-grey looked
-    // right on paper but drove the chromatic blue shadows to literal zero, which is
-    // the same mistake as an over-aggressive black point: the frame keeps its blacks
-    // but loses all colour in them. Low pivot + gentle slope deepens the silhouettes
-    // while leaving the blue in them.
-    col = clamp((col - 0.22) * (1.0 + 0.55 * od) + 0.22, 0.0, 1.0);
-    // Saturation goes UP in overdrive, not down. Overdrive should read as the city
-    // screaming in colour, not as the screen dying.
+    col = pow(col, vec3(1.0 + ${TUNE.OD_CONTRAST.toFixed(3)} * od))
+        * mix(1.0, ${TUNE.OD_LIFT.toFixed(3)}, od);
     float lo = dot(col, LUMA);
-    col = clamp(mix(vec3(lo), col, 1.0 + 1.05 * od), 0.0, 1.0);
-  }
-
-  // --- damage vignette -----------------------------------------------------------
-  // Throbbing magenta/red at the edges. Additive glow plus a small multiplicative
-  // crush, so it reads as blood in the lens rather than as pink fog.
-  float dmg = clamp(u_damage01, 0.0, 1.0);
-  if (dmg > 0.001) {
-    float throb = 0.55 + 0.45 * sin(u_time * 8.5);
-    float edge = smoothstep(0.38, 1.05, rn);
-    col += vec3(1.0, 0.07, 0.36) * edge * dmg * (0.30 + 0.55 * throb);
-    col *= 1.0 - edge * dmg * 0.18;
+    col = lo * mix(vec3(1.0), vec3(${TUNE.OD_TINT[0].toFixed(3)}, ${TUNE.OD_TINT[1].toFixed(3)}, ${TUNE.OD_TINT[2].toFixed(3)}), od)
+        + (col - lo) * (1.0 + ${TUNE.OD_SAT.toFixed(3)} * od);
+    // A chroma gain overshoots the gamut by construction. Clipping the overshoot is
+    // the same hue-destroying mistake the tonemap makes above — measured, a straight
+    // clamp here dragged magenta hazards from 331° to 308°, i.e. a third of the way
+    // back to the magenta primary, in the exact state where saturation is the point.
+    // Scaling by the max channel is hue-exact; it costs a little value on pixels that
+    // were going to clip to 1.0 anyway, which OD_LIFT has already over-provided.
+    col = max(col, 0.0);
+    col /= max(max(max(col.r, col.g), col.b), 1.0);
   }
 
   // --- film grain ----------------------------------------------------------------

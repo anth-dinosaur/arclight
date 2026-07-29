@@ -27,7 +27,10 @@ import { LAYER } from '../core/renderer.js';
 // runs standalone before the missing keys land in config.js. See report.
 // ---------------------------------------------------------------------------
 const SUBSTEP        = CFG.PHYS_SUBSTEP        ?? (1 / 240);
-const MAX_SUBSTEPS   = CFG.PHYS_MAX_SUBSTEPS   ?? 8;
+// Must satisfy MAX_SUBSTEPS * SUBSTEP >= CFG.MAX_SIM_DT, or the player silently
+// receives less sim time per frame than the world does and the game gets harder as
+// the framerate drops. See the note on MAX_SIM_DT in config.js.
+const MAX_SUBSTEPS   = CFG.PHYS_MAX_SUBSTEPS   ?? 12;
 const INV_SUBSTEP    = 1 / SUBSTEP;
 const MAX_FRAME_DT   = CFG.PHYS_MAX_FRAME_DT   ?? 0.25;   // tab-switch guard
 
@@ -174,13 +177,24 @@ const GRAZE_RADIUS   = CFG.GRAZE_RADIUS;
 const GRAZE_COOLDOWN = CFG.GRAZE_COOLDOWN;
 const FLOODLINE      = CFG.FLOODLINE;
 /**
- * Anchors are the most numerous neon geometry in the game and were never scanned,
- * which is most of why GRAZE was dead (measured 2.0/run; adding anchors to the scan
- * takes it to ~22/run, where tripling the radius only reached 3.3). DESIGN.md L3
- * says "neon geometry OR a hazard", and skimming an anchor you deliberately did NOT
- * grab is precisely the L4 line-choice expression the layer is supposed to reward.
- * The anchor currently held and the one just auto-hopped off are excluded — you
- * cannot graze what you are attached to.
+ * OFF by default (`CFG.GRAZE_ANCHORS: false`), and the history is worth keeping because
+ * the reasoning that turned it on was locally sound and globally wrong.
+ *
+ * It was switched on because GRAZE was dead at 2.0 events/run, and anchors — the most
+ * numerous neon geometry in the game — took it to ~22/run where widening the radius
+ * could not. DESIGN.md L3 does say "neon geometry OR a hazard". But volume is not the
+ * same as meaning: measured, 92% of all grazes became anchors, i.e. the meter paid out
+ * ~38x per run for flying past the things you were actively AIMING AT. That is not
+ * risk, it is a proximity tax on playing correctly, and it buried the ~2 genuinely
+ * dangerous hazard grazes in noise.
+ *
+ * L3's actual promise is "Risk = reward". With this off, every graze in the game is
+ * something that could have killed you — hazards, and the skim decks the generator now
+ * authors into flight paths. 3.3 events/run, 82% hazard. Fewer, and each one means
+ * something. If you turn this back on, re-read that sentence first.
+ *
+ * When enabled, the anchor currently held and the one just auto-hopped off are still
+ * excluded — you cannot graze what you are attached to.
  */
 const GRAZE_ANCHORS  = CFG.GRAZE_ANCHORS !== false;
 
@@ -323,6 +337,13 @@ export class Player {
     this.perfectCue = 0;
     /** Quality01 the release would score right now, or -1 if outside the window. */
     this.perfectQuality = -1;
+
+    /** True while OVERDRIVE is inside its final OVERDRIVE_EXIT_WINDOW seconds, i.e.
+     *  while the next arc is the EXIT arc. Written by main.js from the same raw-seconds
+     *  boundary the HUD reads, so the avatar cue and the HUD rim can never disagree
+     *  about when the window is open — deriving it here from a remapped overdrive01
+     *  is exactly how those two would drift apart. Render-only; no physics reads it. */
+    this.odExit = false;
 
     /** Set by the game while OVERDRIVE is running. Hazards and lethal solid faces are
      *  skipped entirely — DESIGN.md promises invulnerability and nothing implemented
@@ -964,6 +985,11 @@ export class Player {
         const dx = o.x - x;
         if (dx > win + ex || dx < -win - ex) continue;
         if (o._grazeCd > 0) o._grazeCd -= dt; else o._grazeCd = 0;
+        // Deflect keeps its OWN cooldown. Sharing `_grazeCd` made the deflect event
+        // unreachable: any solid you are close enough to hit, you first grazed, and
+        // the graze write (0.9s) always beat the deflect read. See the note at the
+        // deflect gate in _collide().
+        if (o._deflectCd > 0) o._deflectCd -= dt; else o._deflectCd = 0;
         this._solidIdx[this._solidN++] = i;
       }
     }
@@ -1082,8 +1108,17 @@ export class Player {
         // bumping into architecture scored and charged identically to threading past
         // it: the L3 skill layer paying out for the exact opposite of the skill.
         // It gets its own event, and no score.
-        if (!(o._grazeCd > 0)) {
-          o._grazeCd = DEFLECT_CD;
+        //
+        // The gate reads `_deflectCd`, NOT `_grazeCd`, and the distinction is the whole
+        // reason this event exists at all. Sharing one field made the deflect
+        // structurally unreachable — 100% suppression, measured: 1.5 deflect *responses*
+        // per run producing 0.0 *events*. To hit a solid you must pass within
+        // PLAYER_RADIUS of it, which is inside GRAZE_RADIUS, so `_grazeCd` was always
+        // set by _grazeScan a frame or two earlier and still had most of its 0.9s left.
+        // Two different questions ("did I just score a near-miss?" and "did I just bounce
+        // off this?") cannot share one piece of state.
+        if (!(o._deflectCd > 0)) {
+          o._deflectCd = DEFLECT_CD;
           if (events && events.deflect) events.deflect(this.sx, this.sy, o);
         }
       }
@@ -1209,9 +1244,25 @@ export class Player {
       const u = k / TRAIL_N;                    // 0 = head, 1 = tail
       const taper = (1 - u) * (1 - u);
       const sp = clamp01(t[o0 + 2] / TERMINAL);
-      const w = 0.10 + RADIUS * 0.95 * taper;
-      tint(CA, PAL.cyanHot, (0.20 + 1.15 * sp) * taper * hot, 1);
-      r.line(LAYER.NEON, x0, y0, x1, y1, w, CA, { glow: 0.9 + sp, glowRadius: w * 3.4, soft: 0.05 });
+      // The ribbon has to emerge from BEHIND the avatar, not on top of it. A trail
+      // point is laid every TRAIL_INTERVAL (1/90 s), so at cruise a segment is ~0.6
+      // world units against a 1.0-unit body: the first four segments were the widest
+      // and hottest the ribbon ever gets AND they sat directly on the player. Fading
+      // them in costs nothing visually — the ribbon stays continuous because the body
+      // covers exactly the part being faded — and it is what lets the avatar have a
+      // silhouette at all.
+      const emerge = k < 4 ? 0.14 + k * 0.215 : 1;
+      const w = (0.10 + RADIUS * 0.95 * taper) * (0.34 + 0.66 * emerge);
+      // The ribbon was the single largest flat region in the frame, and it was the
+      // HALO doing it, not the core: glowRadius w*3.4 with glow 0.9+sp put a ~4.7-unit
+      // wide band across a third of the screen, at 5-8x the bright-pass threshold once
+      // the ~4 overlapping segments per pixel are summed — uniformly clipped, with no
+      // falloff, and the avatar inside it. The halo now scales at 0.9x the core with
+      // roughly half the strength, so the ribbon has a hot centreline and a real edge
+      // instead of being one slab of cyan.
+      tint(CA, PAL.cyanHot, (0.10 + 0.62 * sp) * taper * hot * emerge, 1);
+      r.line(LAYER.NEON, x0, y0, x1, y1, w, CA,
+        { glow: 0.35 + 0.45 * sp, glowRadius: w * 0.9, soft: 0.05 });
     }
 
     // ---- tether ------------------------------------------------------------
@@ -1294,34 +1345,155 @@ export class Player {
     }
 
     // ---- player body -------------------------------------------------------
+    // DESIGN.md's FIRST aesthetic rule is "nothing is flat: every emissive element has
+    // a bloom halo and a dimmer core-to-edge falloff". This was the worst violator in
+    // the build, and it is the thing the eye is locked on for the whole run.
+    //
+    // The cause was not the shapes, it was the EMISSION LEVELS. The old body drew a
+    // white core at PAL.white * 2.9 = (7.5, 8.4, 8.7) with glow 2.6 over a 1.5-unit
+    // halo radius, under a ring at (0.8, 5.7, 6.6) with its own 1.1-unit halo, under a
+    // 3.0-unit haze disc, with the trail's hottest segment on top of all of it. Every
+    // one of those lands past 5.0, and past ~5.0 the tonemapper cannot tell any two
+    // values apart — they all resolve to the same near-white. Four carefully drawn
+    // concentric elements arrived as one plate: measured on a cruise frame, 100% of
+    // the avatar box above luma 200 with sd/peak of 1.6%.
+    //
+    // The rebuild is a BUDGET, and the budget is mostly about SUBTRACTION. Measured
+    // through a static rig that draws the avatar and nothing else, as a radial
+    // luminance profile out from the centre in world units, at cruise:
+    //     before   234 234 234 233 231 230 230 228 227 226 224 221 218
+    //     after    250 250 226 219 220 208 158 108  78  50  30  21  16
+    //              u=0 .25 .5  .75 1.0 1.25 1.5 1.75 2.0 2.25 2.5 2.75 3.0
+    // The old avatar was flat to within 16 luma across SIX world units. And on the
+    // same rig, mid-build, with a haze disc and an interior fill added back:
+    //     247 246 242 231 224 218 166 107  77
+    // — same peak, same outer falloff, and the only thing they changed was to fill in
+    // the 0.5-0.75 gap that the structure was living in. On a 50-device-pixel object
+    // under this much bloom the interior is a scarce resource: an extra emissive
+    // element inside the silhouette is subtracted from the read, not added to it.
+    //
+    // Box statistics over +/-2.2 world units, and the widest run of luma > 200 through
+    // the avatar's own row as a fraction of frame width:
+    //     sd / peak       1.6%  -> 29.5%
+    //     pixels > 200     100% -> 36.4%
+    //     hot run          24.1% of frame width -> 6.4%
+    //
+    // So: four elements, none of them redundant, at s01 = 1:
+    //     core 7.2 white -> rim 3.3 cyan -> lance 2.3 white -> wings 1.04 cyan
+    // Brightest at the CENTRE and second-brightest at the RIM, with a deliberately
+    // empty annulus between them; the falloff outside the rim is left to the post
+    // bloom, which is what DESIGN.md means by "light does the drawing". The separate
+    // haze disc, body fill and shell ring are gone — the bloom already provides the
+    // halo they were duplicating. Footprint drops with them: the old haze alone was
+    // 3.0 world units of radius, the whole avatar is now inside 1.6.
+    //
+    // ---- AND THE REBUILD ABOVE STILL DID NOT LAND, for one reason ------------------
+    // Every number above was chosen against a tonemap that had NO HIGHLIGHT RESPONSE
+    // (see the knee note in post.js): above ~2 emission the output stopped depending on
+    // input at all, so "core 4.6 white, rim 3.7 cyan" was a hue difference and nothing
+    // else. Measured live at s01 = 1, on the frozen-frame rig tools/dev/.avshot.mjs,
+    // radial luminance and saturation in world units out from the centre:
+    //     before  lum 244 244 235 222 219 218 205 174 143 119 103  95  92
+    //             sat .11 .12 .26 .48 .52 .54 .64 .68 .65 .62 .59 .55 .56
+    //     after   lum 253 250 233 226 252 217 193 164 133 113  99  93  88
+    //             sat .00 .05 .28 .38 .02 .51 .61 .63 .61 .59 .57 .54 .54
+    //             u = 0  .25 .50 .75 1.0 1.25 1.5 1.75 2.0 2.25 2.5 2.75 3.0
+    // Before: a monotone slide, 26 luma of variation across the whole body, and a
+    // "white core" at saturation 0.11 — i.e. not white. After: a genuinely white core
+    // (sat 0.00-0.05), a dimmer chromatic trough at u = 0.75 (226 / 0.38), and the rim
+    // reading as a VALUE SPIKE back to 252 before the halo falls away. Two peaks and a
+    // trough where there used to be a ramp. That is the "chroma well with a value
+    // gradient" this comment claimed and did not have.
+    //
+    // Two knock-on adjustments, both forced and both worth writing down:
+    //   - the core radius came DOWN (0.24 -> 0.18) as its emission went up. Bloom
+    //     energy is area x emission, so 5.6-7.2 at the old radius made the avatar a
+    //     3-world-unit ball of white at speed — the same failure, opposite direction.
+    //   - the rim's speed term came down (s01 * 1.80 -> 1.40). At full speed the core's
+    //     bloom already lands on the rim, and the two together took the rim to white,
+    //     which would have eaten the perfect-window step below.
     const a = this.renderAngle;
     const ca = Math.cos(a), sa = Math.sin(a);
     const perp = this.inPerfectWindow ? 1 : 0;
+    // THE AVATAR IS ALWAYS CYAN. There used to be an amber skin flip while the perfect
+    // window was open, and it was a category error: amber is the ORB colour, so for
+    // ~100ms the player object was constructed identically to, and coloured the same
+    // as, the four collectibles sharing the frame with it. The cue below already
+    // speaks amber for this exact event, so the flip was redundant confirmation spent
+    // on the one object in the game whose colour identity is load-bearing. Measured,
+    // it was hue-only — the luminance profiles of the two states were identical — so
+    // it changed nothing but the weakest channel available.
+    //
+    // The perfect window is signalled on channels nothing else owns instead: a hard
+    // VALUE step on the rim (brightness AND thickness, no ramp — it is a snap), and
+    // the lance going white-hot. DESIGN.md assigns white-hot to "overdrive, impacts",
+    // i.e. to instantaneous events, and a ~100ms window is one.
+    const skin = PAL.cyanHot;
 
-    // Speed halo.
-    // The halo used to peak at 6.6 world units against a 1.02-unit body ring — 6.5x
-    // the character — emitting 3.4x over the bright-pass threshold across the whole
-    // disc. That clipped to a flat cyan plateau ~29% of the frame wide with no
-    // internal structure, burying the directional wings, outer ring and white-hot
-    // core drawn below it. Kept under the threshold so it blooms without plateauing.
-    tint(CA, PAL.cyanHot, 0.14 + s01 * 0.30, 1);
-    r.glow(LAYER.NEON, x, y, 1.5 + s01 * 1.5, CA, { glow: 0.9, glowRadius: 1.6 + s01 * 1.4 });
-
-    // Directional wings — heading must be readable in a single glance.
+    // 1. WINGS. Heading must be readable in a single glance. Pushed OUT to ±1.02 and
+    //    slimmed to 0.19 so they break the circular silhouette instead of hiding
+    //    inside it, and kept well under the rim so they never become the brightest
+    //    thing — direction is a secondary read, position is the primary one.
     const wingRot = a - HALF_PI;
-    tint(CB, perp ? PAL.amberHot : PAL.cyanHot, (0.75 + s01 * 1.15) * (1 + perp * 0.6), 1);
+    tint(CB, skin, (0.42 + s01 * 0.62) * (1 + perp * 0.5), 1);
     for (let k = -1; k <= 1; k += 2) {
-      const ox = -sa * k * 0.78 - ca * 0.30;
-      const oy =  ca * k * 0.78 - sa * 0.30;
-      r.tri(LAYER.NEON, x + ox, y + oy, 0.30, 0.82, wingRot, CB,
-        { glow: 1.5, glowRadius: 0.9, soft: 0.05 });
+      const ox = -sa * k * 1.02 - ca * 0.46;
+      const oy =  ca * k * 1.02 - sa * 0.46;
+      r.tri(LAYER.NEON, x + ox, y + oy, 0.19, 0.88, wingRot, CB,
+        { glow: 0.55, glowRadius: 0.20, soft: 0.05 });
     }
 
-    // Outer ring + white-hot core.
-    tint(CA, perp ? PAL.amberHot : PAL.cyanHot, 1.0 + s01 * 1.2 + perp * 0.9, 1);
-    r.ring(LAYER.NEON, x, y, 1.02, 0.15, CA, { glow: 1.9, glowRadius: 1.1, soft: 0.045 });
-    tint(CB, PAL.white, 1.5 + s01 * 1.4, 1);
-    r.circle(LAYER.NEON, x, y, 0.52, CB, { glow: 2.6, glowRadius: 1.5, soft: 0.04 });
+    // 2. RIM. The silhouette. A thin ring at the collision-forgiving edge of the
+    //    sprite, saturated cyan — the tonemap's max-channel normalisation is what lets
+    //    this stay CYAN at emission 3.3 instead of washing to the same white as the
+    //    core. Measured, the rim lands at 9.9 linear and the core at 21.6, and the
+    //    tonemap's highlight knee starts at 9 — so the core bleaches and the rim does
+    //    not. That is a VALUE difference now, not only a hue one.
+    //
+    //    The halo is 0.10, not 0.26. A 0.26 halo on a 0.12-thick ring is 2.2x the
+    //    shape, and on a ring it does not spread outward, it spreads BOTH ways — so it
+    //    flooded inward and filled the deliberately empty annulus between rim and core
+    //    solid. Live profile of the finished avatar was 26 luma of variation across the
+    //    entire body: the four-element structure existed in the source and nowhere on
+    //    the screen. The outward half of that halo is bloom's job anyway.
+    //
+    //    perp is a STEP, not a ramp: +2.6 emission and +58% thickness, arriving in one
+    //    frame. That is the replacement for the deleted amber flip, and unlike a hue
+    //    change it survives being seen out of the corner of the eye.
+    tint(CB, skin, 1.90 + s01 * 1.40 + perp * 2.60, 1);
+    r.ring(LAYER.NEON, x, y, 1.00, 0.12 + perp * 0.07, CB,
+      { glow: 1.2, glowRadius: 0.10, soft: 0.04 });
+
+    // 3. CORE. 0.18 units against the old 0.52, with a 0.14 halo instead of 1.5. The
+    //    only part of the avatar allowed to reach white, and it is ~3% of the body
+    //    area. White at a point that small exists nowhere else in the world, so it is
+    //    also the second channel of "this is you".
+    //
+    //    5.6-7.2, not 2.6-4.6, and the number is chosen against the tonemap's
+    //    highlight knee rather than by eye. At 4.6 the core arrived at 13.8 linear —
+    //    m = 21.8 after the post grade, barely onto the knee — so it was the same
+    //    near-white as the rim and "core" was a hue difference only. At 5.6-7.2 it
+    //    lands at 16.8-21.6 linear (m = 28-37, knee weight 0.33-0.58) and genuinely
+    //    bleaches, while the rim at 9.9 linear (m = 14.9, weight 0.03) stays saturated
+    //    cyan. That is a chroma well WITH a value gradient, which is what the profile
+    //    above was supposed to show and did not.
+    //    The RADIUS comes down with the emission going up, and it has to: bloom energy
+    //    goes as area x emission, so raising 2.6-4.6 to 5.6-7.2 at the old 0.24/0.20
+    //    turned the avatar into a 3-world-unit ball of white at speed — a different
+    //    failure with the same cause. 0.18/0.14 puts the total energy back at ~0.8x of
+    //    the old element while roughly doubling its PEAK, which is the whole point.
+    tint(CA, PAL.white, 5.6 + s01 * 1.6, 1);
+    r.circle(LAYER.NEON, x, y, 0.18, CA, { glow: 1.4, glowRadius: 0.14, soft: 0.03 });
+
+    // 4. LANCE. A thin forward spike off the core, deliberately OUTSIDE the rim where
+    //    there is empty frame to draw into. This is the directional read that survives
+    //    at 60fps when the wings have motion-blurred into the silhouette. It is also
+    //    the second half of the perfect-window step: white-hot and longer, for the
+    //    ~100ms the window is open.
+    tint(CB, PAL.white, (1.05 + s01 * 1.25) * (1 + perp * 1.30), 1);
+    const lance = 1.52 + perp * 0.34;
+    r.line(LAYER.NEON, x + ca * 1.02, y + sa * 1.02, x + ca * lance, y + sa * lance, 0.085, CB,
+      { glow: 0.80, glowRadius: 0.14, soft: 0.04 });
 
     // ---- PREDICTIVE perfect-arc cue ---------------------------------------
     // A collapsing amber ring that starts P_ETA_LEAD seconds BEFORE the window opens
@@ -1329,11 +1501,55 @@ export class Player {
     // confirmation — this is the part a human can actually act on, because it gives
     // back the ~250ms of reaction time the old instantaneous cue never had. The
     // collapse is the read: "let go when the ring touches you."
+    //
+    // TICKS, NOT A RING, and this is the part that had to change. The mechanic is
+    // right; the drawing swallowed the thing it was pointing at. A continuous annulus
+    // at glowRadius 1.0 against a 0.06-0.16 core is a 6-17x halo-to-shape ratio —
+    // fx.js names exactly that ratio "the definition of a smudge" — and it measured as
+    // a FLAT amber band from r=3.1 to r=5.1 world units, luminance plateau 196-215,
+    // outer diameter 20-24% of the frame, firing about once a second. It was the
+    // single largest object on screen and it enclosed the avatar in a solid disc of
+    // the orb colour.
+    //
+    // Six radial ticks carry the same information — a radius, collapsing — while
+    // occluding almost nothing: 6 x 0.1 units of arc instead of a full circumference,
+    // halo 0.13 instead of 1.0, and the collapse radius capped at 1.15 + 2.6 rather
+    // than 1.15 + 5.2. Measured on the frame where the cue lands (c = 0.9), the run
+    // of luma > 200 through the avatar's own row went 13.2% -> 8.3% of frame width and
+    // the lit extent 14.5% -> 10.5%, and the flat amber plateau that used to sit at
+    // luma 217-222 all the way out to 3 world units now falls to 92 by u = 2.5.
+    // The collapse also reads BETTER as separate marks: converging objects show
+    // motion, whereas a shrinking circle mostly shows size.
     if (this.perfectCue > 0 && !perp) {
       const c = this.perfectCue;
-      tint(CC, PAL.amberHot, 0.30 + 1.30 * c * c, 1);
-      r.ring(LAYER.FOREGROUND, x, y, 1.15 + (1 - c) * 5.2, 0.06 + 0.10 * c, CC,
-        { glow: 1.2 + c * 1.4, glowRadius: 1.0, soft: 0.06 });
+      const rr = 1.15 + (1 - c) * 2.6;          // the collapsing radius itself
+      // Long and thin, ~9:1. At 4:1 with round caps a tick draws as a lozenge, which
+      // in this palette is an ORB — the last thing this cue may be mistaken for.
+      const len = 0.45 + 0.95 * (1 - c);        // ticks shorten as they land
+      // THE EXIT BEAT. During overdrive's final window the next arc is the exit arc,
+      // and that was previously legible only from a 58px ring in the screen corner —
+      // a peripheral read, demanded during the noisiest visual state in the game, for
+      // a decision worth OVERDRIVE_REFUND. The HUD rim already beats at a 300ms period;
+      // beating the avatar's own cue at the SAME period fuses the two into one signal,
+      // so the ring the player is already staring at is what says "this one is the
+      // exit". Frequency is the carrier, not colour: the cue is amber in both states,
+      // and amber-on-amber would say nothing. A beat survives peripheral vision, and
+      // it is the grammar the lasers already taught.
+      const beat = this.odExit
+        ? 0.72 + 0.28 * Math.sin(time * (TAU / 0.30))
+        : 1;
+      const th = (0.07 + 0.10 * c) * (this.odExit ? 1.55 : 1);
+      tint(CC, PAL.amberHot, (0.50 + 1.80 * c * c) * (this.odExit ? 1.85 * beat : 1), 1);
+      for (let k = 0; k < 6; k++) {
+        const ta = k * (TAU / 6) + 0.26;
+        const tc = Math.cos(ta), ts = Math.sin(ta);
+        // Centred on rr, not starting at it: the collapse radius is what carries the
+        // information, so the mark straddles it and the outer footprint stays capped.
+        const i0 = rr - len * 0.5, i1 = rr + len * 0.5;
+        r.line(LAYER.FOREGROUND, x + tc * i0, y + ts * i0,
+          x + tc * i1, y + ts * i1, th, CC,
+          { glow: 1.2 + c * 1.4, glowRadius: 0.13, soft: 0.05 });
+      }
     }
 
     // Perfect-arc burst.

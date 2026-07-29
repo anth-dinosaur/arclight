@@ -1,3 +1,7 @@
 node_modules/
 shots/
 .DS_Store
+nohup.out
+# Scratch harnesses. README's convention is that a dot-prefixed tool is disposable —
+# written to answer one question and not maintained. Only promoted tools are tracked.
+tools/dev/.*

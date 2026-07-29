@@ -89,13 +89,31 @@ const SPAWN_VX = new Float64Array([14, 26, 38]);
 // cleared against a *band* of sags, not a single curve.
 const ARC_SAG      = CFG.ARC_SAG ?? 12;
 const ARC_SAMPLES  = CFG.ARC_SAMPLES ?? 9;
-// Negative entries are the RISE band: a late release, or a whip round a long rope,
-// carries the player well ABOVE the line joining two anchors, so the overhead gantries
-// have to be cleared too — not just the floor.
-const SAG_BAND = new Float64Array([
-  -ARC_SAG * 1.85, -ARC_SAG * 1.3, -ARC_SAG * 0.75, -ARC_SAG * 0.3,
-  ARC_SAG * 0.4, ARC_SAG * 0.8, ARC_SAG * 1.15, ARC_SAG * 1.55,
-]);
+// The GUARANTEED-CLEAR inner envelope. Negative entries are the RISE band: a late
+// release, or a whip round a long rope, carries the player above the line joining two
+// anchors, so the overhead gantries have to be cleared too — not just the floor.
+//
+// This used to span the whole uncertainty envelope (-1.85..+1.55 of ARC_SAG, roughly
+// ±20u after the line-clearance radius) and therefore evacuated every solid from every
+// flight path in the game: measured ZERO deflects across 90 runs. Now only the inner
+// envelope is protected, so the nominal line is still guaranteed clear but the extremes
+// of a badly-timed release meet architecture. See CFG.ARC_SAG_BAND for the full
+// argument; the multipliers live there because config.js owns every magic number.
+const SAG_BAND = Float64Array.from(
+  CFG.ARC_SAG_BAND ?? [-0.85, -0.45, -0.15, 0.30, 0.65, 0.95],
+  (m) => m * ARC_SAG);
+// The FULL uncertainty envelope. Structure that presents a HARD FACE — a pylon, a
+// shaft wall, a support column — is still evacuated from all of it, because a face hit
+// square kills and a column can only ever be hit square. Only the flat DECKS
+// (catwalks, gantry floors) are allowed into the outer envelope: their exposed faces
+// run along the direction of travel, so contact there is a skim, which is a deflect,
+// which is the "skimming structure reads as skill" the forgiveness machinery exists
+// for. Measured: allowing everything in produced 5 solid deaths and STILL zero
+// deflects — every contact was square. This split is what makes architecture a
+// texture you brush against rather than a new way to die.
+const SAG_BAND_FULL = Float64Array.from(
+  CFG.ARC_SAG_BAND_FULL ?? [-1.85, -1.3, -0.75, -0.3, 0.4, 0.8, 1.15, 1.55],
+  (m) => m * ARC_SAG);
 
 // ---- catch row ------------------------------------------------------------------
 // A secondary row of anchors slung below the main chain. They are never load-bearing —
@@ -106,18 +124,37 @@ const SAG_BAND = new Float64Array([
 // second floor: a player only a little low takes the shallow rung, one who has really
 // dropped can still reach the deep rung. Combined with TETHER_MAX_RANGE that extends
 // the recoverable envelope to roughly 60m below the chain.
-const CATCH_SPACING = CFG.WORLD_CATCH_SPACING ?? 24;
+// 15, not 24. The catch row exists to make a bad release recoverable, and it had a
+// hole exactly where it was needed most: probing the `metronome` bot (a player who
+// releases on a rhythm without looking — the tier closest to a real human still
+// learning), at the instant of a FLOODLINE death the nearest anchor ABOVE averaged
+// 31.9 units against a 26-unit tether, and there was nothing in reach for 60% of the
+// final sink. The net had gaps wider than the rope. At 15 an anchor is in range for
+// 70% of the sink, drownings fall 22 -> 18 per 60 runs, and the mid tier gains 35m of
+// median distance. It costs the top tier nothing — a player who does not sag never
+// meets these — so it widens the skill gradient rather than flattening it (measured
+// smart/hold score 9.9x -> 13.2x over 60 seeds). Anchor budget stays at 6.5 of 14 per
+// chunk with zero pool misses.
+const CATCH_SPACING = CFG.WORLD_CATCH_SPACING ?? 15;
 const CATCH_DROP    = CFG.WORLD_CATCH_DROP ?? 20;
 const CATCH_DROP2   = CFG.WORLD_CATCH_DROP2 ?? 14;
 const CATCH_P       = CFG.WORLD_CATCH_P ?? 0.92;
 const CATCH_Y_MAX   = CFG.WORLD_CATCH_Y_MAX ?? (FLOODLINE - 13);
 
+// ---- floodline alarm ------------------------------------------------------------
+// See `_renderFloodline`. The rate sweeps from HZ0 at the top of FLOOD_WARN_BAND to
+// HZ1 at the water; an accelerating beat reads as "closing" in peripheral vision,
+// which a brightness ramp does not.
+const FLOOD_HZ = CFG.FLOOD_WARN_HZ ?? [1.1, 5.0];
+const FLOOD_HZ0 = FLOOD_HZ[0];
+const FLOOD_HZ1 = FLOOD_HZ[1];
+
 // Difficulty curve. `diff` is asymptotic: 1 - e^-((x - TUT) / SCALE).
-// SCALE was 1400, which at the ~46 world-u/s cruise put the curve half-run by 30s.
-// 2200 stretches the same shape over the distance a competent player actually covers
-// before the run ends, so the ramp is felt as progression rather than as an ambush.
+// Both numbers are tuned in config.js against measured distance-vs-time curves for all
+// three bots — see the block comment there. The short version: at SCALE 2200 the curve
+// only reached diff 0.36 by the end of a median run, so most of it was never played.
 const TUT_DIST     = CFG.TUTORIAL_DIST;
-const DIFF_SCALE   = CFG.WORLD_DIFF_SCALE ?? 2200;
+const DIFF_SCALE   = CFG.WORLD_DIFF_SCALE ?? 900;
 
 // Anchor spacing. SPACING_MAX is the hard density floor from DESIGN.md — no matter
 // how far you run, anchors never get sparser than this.
@@ -177,12 +214,11 @@ const HAZ_CLEAR_LASER = CFG.WORLD_HAZ_CLEAR_LASER ?? 7.5;
  *  arrival time at cruise, which is what makes going fast a choice rather than a tax. */
 const HAZ_SEP_EARLY = CFG.WORLD_HAZ_SEP_EARLY ?? 34;
 const HAZ_SEP_LATE  = CFG.WORLD_HAZ_SEP_LATE ?? 18;
-// Distance before each kind unlocks. All pushed out to sit behind the extended
-// tutorial (TUTORIAL_DIST 800): a drone at 620 arrived 13.2s into the run, inside the
-// grace period DESIGN.md L1 promises.
-const HAZ_DRONE_X  = CFG.WORLD_HAZ_DRONE_X ?? 1000;  // metres before drones appear
-const HAZ_SPIN_X   = CFG.WORLD_HAZ_SPIN_X ?? 1900;   // ... spinners
-const HAZ_GATE_X   = CFG.WORLD_HAZ_GATE_X ?? 2900;   // ... moving gates
+// World distance before each kind unlocks; tuned in config.js against the difficulty
+// curve. Each is a separate beat in the run — a new verb arriving, not a density bump.
+const HAZ_DRONE_X  = CFG.WORLD_HAZ_DRONE_X ?? 480;   // world units before drones appear
+const HAZ_SPIN_X   = CFG.WORLD_HAZ_SPIN_X ?? 850;    // ... spinners
+const HAZ_GATE_X   = CFG.WORLD_HAZ_GATE_X ?? 1150;   // ... moving gates
 // Laser duty cycle. The period and the lethal fraction are both eased by difficulty:
 // the first beams a player ever meets are off for ~2.4s at a time, the late ones for
 // ~1.4s. A beam you cannot wait out is not a hazard, it is a wall.
@@ -191,6 +227,13 @@ const LASER_PERIOD_EARLY = CFG.WORLD_LASER_PERIOD_EARLY ?? 3.3;
 const LASER_ON     = CFG.WORLD_LASER_ON ?? 0.46;  // fraction of the cycle the beam is lethal
 const LASER_ON_EARLY = CFG.WORLD_LASER_ON_EARLY ?? 0.26;
 const LASER_TELL   = CFG.WORLD_LASER_TELL ?? 0.4; // seconds of charge-up telegraph
+// The authored first hazard — see CFG. `FIRST_HAZ_CHUNK` is the first chunk that is not
+// tutorial, so this beat always lands the moment the grace period ends, on every seed.
+const FIRST_LASER_PERIOD = CFG.WORLD_FIRST_LASER_PERIOD ?? 3.6;
+const FIRST_LASER_ON = CFG.WORLD_FIRST_LASER_ON ?? 0.22;
+const FIRST_LASER_HW = CFG.WORLD_FIRST_LASER_HW ?? 8;
+const FIRST_HAZ_X  = CFG.WORLD_FIRST_HAZ_X ?? 480;
+const FIRST_HAZ_CHUNK = Math.ceil(FIRST_HAZ_X / CHUNK_W);
 /**
  * DRONE DUTY CYCLE. Drones were 53% of all deaths (31 of 59) and the only hazard in
  * the game with no timing-out: lasers are lethal 26-46% of a cycle behind a 0.4s
@@ -201,7 +244,14 @@ const LASER_TELL   = CFG.WORLD_LASER_TELL ?? 0.4; // seconds of charge-up telegr
  * 65% of a 2.2s period leaves a 0.77s window, comfortably above the 0.4s tell.
  */
 const DRONE_PERIOD = CFG.WORLD_DRONE_PERIOD ?? 2.2;
-const DRONE_ON     = CFG.WORLD_DRONE_ON ?? 0.65;  // fraction of the cycle it is lethal
+/** Lethal fraction of the cycle, eased by difficulty exactly as the laser's is.
+ *  It used to be a single flat 0.65: a drone met at 480 units was every bit as lethal
+ *  as one met at 4800, which is a FLAT SPOT in a curve that is supposed to curve — and
+ *  drones are the first kind to unlock, so the flat spot sat right where the player is
+ *  meeting their first real threat. 0.40 early leaves a 1.3s dormant window behind a
+ *  0.45s tell; 0.70 late leaves 0.66s and demands you read it. */
+const DRONE_ON_EARLY = CFG.WORLD_DRONE_ON_EARLY ?? 0.40;
+const DRONE_ON     = CFG.WORLD_DRONE_ON ?? 0.70;
 const DRONE_TELL   = CFG.WORLD_DRONE_TELL ?? 0.45; // seconds of spool-up telegraph
 /** Patrol speed. 6.0 made the sweep faster than a player could read across a corridor
  *  they were already committed to; 4.0 keeps the pocket legible. */
@@ -238,6 +288,15 @@ const SUPPORT_P    = CFG.WORLD_SUPPORT_P ?? 0.72;
 const UNDER_DROP   = CFG.WORLD_UNDER_DROP ??
   (CATCH_DROP + CATCH_DROP2 + ARC_SAG * 1.55 + SOLID_LINE_CLEAR + 3);
 
+// Skim decks — see CFG. Flat gantry decks authored into the band between the
+// guaranteed-clear inner envelope and the outer edge of the release-timing envelope.
+const SKIM_MAX     = CFG.SKIM_DECK_MAX ?? 2.2;
+const SKIM_NEAR    = (CFG.SKIM_DECK_NEAR ?? 1.22) * ARC_SAG;
+const SKIM_FAR     = (CFG.SKIM_DECK_FAR ?? 1.62) * ARC_SAG;
+const SKIM_HW      = CFG.SKIM_DECK_HW ?? [5, 11];
+const SKIM_HH      = CFG.SKIM_DECK_HH ?? [0.5, 1.0];
+const SKIM_LC      = CFG.SKIM_DECK_LINE_CLEAR ?? 2.0;
+
 // Budget / pools.
 const PRIM_BUDGET  = CFG.WORLD_PRIM_BUDGET ?? 700;
 const CULL_PAD     = CFG.WORLD_CULL_PAD ?? 1.0;   // × viewW on each side
@@ -272,13 +331,25 @@ const AR_COUNT     = 8;
 const AR_LAUNCH    = 8;
 
 /**
- * The authored opening ladder, relative to (SPAWN_X, SPAWN_Y). Fixed, not random:
- * these four nodes are the spawn contract. The first three are forward of the player
- * and above them, at 16.5 / 16.2 / 22.5 metres — all inside
- * [TETHER_MIN_RANGE, TETHER_MAX_RANGE] — so the very first tap always connects.
+ * The authored opening ladder, relative to (SPAWN_X, SPAWN_Y). These four nodes are
+ * the spawn contract: all forward of the player, all above them, all inside
+ * [TETHER_MIN_RANGE, TETHER_MAX_RANGE], so the very first tap always connects.
+ *
+ * They used to be exactly these numbers on every seed, which made the first two swings
+ * of every session — the only part of the run a new player is looking at properly —
+ * byte-identical forever. `_archLaunch` now jitters them per seed and then RE-IMPOSES
+ * the contract on the result rather than trusting the jitter, so the opening varies
+ * without the guarantee ever depending on luck.
  */
 const LAUNCH_DX = new Float64Array([4, 11, 18, 25]);
 const LAUNCH_DY = new Float64Array([-16, -11, -15, -10]);
+const LAUNCH_JX = CFG.WORLD_LAUNCH_JITTER_X ?? 3.0;
+const LAUNCH_JY = CFG.WORLD_LAUNCH_JITTER_Y ?? 4.5;
+/** Hard bounds the jittered ladder is clamped back into. Below the tether's max range
+ *  with margin, above its min, and always at least this far overhead. */
+const LAUNCH_R_MIN = CFG.TETHER_MIN_RANGE + 6;
+const LAUNCH_R_MAX = CFG.TETHER_MAX_RANGE - 4;
+const LAUNCH_UP_MIN = CFG.WORLD_LAUNCH_UP_MIN ?? 7;
 
 // Per-archetype weight scratch, filled each selection. Module scope = never allocated.
 const ARCH_W = new Float64Array(AR_COUNT);
@@ -326,11 +397,16 @@ function smoothHash(x, s) {
 
 // ---------------------------------------------------------------------------------
 // Difficulty. Distance-driven, continuous, asymptotic — see DESIGN.md.
-//   0–400m    diff 0.00   tutorial: dense anchors, zero hazards
-//   800m      diff 0.25
-//   1200m     diff 0.43
-//   2500m     diff 0.78
-//   5000m     diff 0.96   (never reaches 1 — the asymptote is the promise)
+// All distances are WORLD UNITS; the HUD's metre counter reads world units / 2.
+//   0–340   diff 0.00   tutorial: dense anchors, zero hazards, walls only bounce
+//   600     diff 0.25
+//   800     diff 0.40
+//   1200    diff 0.62
+//   1800    diff 0.79   (roughly where a good run ends — the curve is now mostly PLAYED)
+//   3000    diff 0.94
+//   6000    diff 1.00-  (never reaches 1 — the asymptote is the promise)
+// The old shape put diff at only 0.36 where a median run ended, so two thirds of the
+// authored range was unreachable. See config.js for the calibration.
 // ---------------------------------------------------------------------------------
 function difficultyAt(x) {
   if (x <= TUT_DIST) return 0;
@@ -356,7 +432,7 @@ function rawArchetype(ci, seed) {
   const tut = x0 < TUT_DIST;
 
   // Weights ramp with difficulty. In the tutorial only the gentle, teaching shapes
-  // are legal, so the player's first 400m is dense anchors and clean rhythms.
+  // are legal, so the player's opening is dense anchors and clean rhythms.
   ARCH_W[AR_OPEN_SPAN] = tut ? 0 : 0.15 + 0.95 * d;
   ARCH_W[AR_STAIR_UP]  = 1.05 - 0.45 * d;
   ARCH_W[AR_STAIR_DN]  = 0.90 - 0.30 * d;
@@ -424,9 +500,13 @@ export class World {
       x: 0, y: 0, r: ORB_R, alive: false, phase: 0, collected: false,
       chunk: 0, hy: 0,
     }));
+    // `_grazeCd` is the player's graze band; `_deflectCd` is the deflect event's own
+    // rate limit. These MUST be separate fields: sharing one meant the graze write
+    // (0.9s) always landed before the deflect read, because anything you touch you
+    // grazed on the way in — which suppressed the `deflect` event 100% of the time.
     this._pSolid = new Pool(MAX_SOLIDS, () => ({
       x: 0, y: 0, hw: 1, hh: 1, rot: 0,
-      chunk: 0, style: 0, sign: 0,
+      chunk: 0, style: 0, sign: 0, _grazeCd: 0, _deflectCd: 0,
     }));
 
     // ---- exported views -------------------------------------------------------
@@ -457,6 +537,12 @@ export class World {
     this._chunkO = 0;
     this._chunkS = 0;
     this._rs = 0;                 // inline mulberry32 state (see _rnd)
+
+    // ---- floodline alarm ------------------------------------------------------
+    // Integrated so the beat can accelerate without the pulse jumping phase — a
+    // discontinuity here reads as a dropped frame, which is the opposite of urgency.
+    this._floodPhase = 0;
+    this._floodTime = 0;
 
     // ---- diagnostics ----------------------------------------------------------
     this.debugCount = 0;          // primitives submitted last frame
@@ -852,8 +938,28 @@ export class World {
    * lands exactly where the contract says it must; `_verifyChunk` still audits it.
    */
   _archLaunch(ci, speed) {
+    // Jitter, then re-impose the contract. The clamps are the guarantee; the jitter is
+    // only allowed to move a node inside them. Every emitted node is therefore forward
+    // of the player, at least LAUNCH_UP_MIN above them, and inside tether range — by
+    // construction, on every seed, exactly as when these were four hard-coded numbers.
+    let px = SPAWN_X, py = SPAWN_Y;
     for (let i = 0; i < LAUNCH_DX.length; i++) {
-      this._emitAnchor(ci, SPAWN_X + LAUNCH_DX[i], SPAWN_Y + LAUNCH_DY[i], 0);
+      let dx = LAUNCH_DX[i] + this._rj(LAUNCH_JX);
+      let dy = LAUNCH_DY[i] + this._rj(LAUNCH_JY);
+      if (dy > -LAUNCH_UP_MIN) dy = -LAUNCH_UP_MIN;      // always overhead
+      // Distance from the point the player will actually be tethering FROM: the spawn
+      // for the first node, the previous node afterwards.
+      const ox = SPAWN_X + dx - px, oy = SPAWN_Y + dy - py;
+      const d = Math.sqrt(ox * ox + oy * oy);
+      if (d > 1e-4) {
+        const k = d < LAUNCH_R_MIN ? LAUNCH_R_MIN / d
+          : d > LAUNCH_R_MAX ? LAUNCH_R_MAX / d : 1;
+        if (k !== 1) { dx = (px + ox * k) - SPAWN_X; dy = (py + oy * k) - SPAWN_Y; }
+      }
+      if (dy > -LAUNCH_UP_MIN) dy = -LAUNCH_UP_MIN;
+      if (dx < 3) dx = 3;                                 // never behind the player
+      px = SPAWN_X + dx; py = SPAWN_Y + dy;
+      this._emitAnchor(ci, px, py, 0);
     }
   }
 
@@ -1157,18 +1263,22 @@ export class World {
 
   /**
    * Hazards *requested* per chunk, following DESIGN.md's distance curve:
-   *   < 400m   0.00   (tutorial: zero hazards, guaranteed)
-   *     800m   0.60      1200m  1.20      2500m  2.48      5000m  3.24  → asymptote 3.4
+   *   < 340    0.00   (tutorial: zero hazards, guaranteed)
+   *     600     0.55      800    1.10      1200   1.87      1800   2.51  → asymptote 3.4
    * The fractional part is resolved by a deterministic coin flip so the mean is exact
    * but individual chunks still breathe.
    *
    * This is a ceiling, not a quota. Placement then has to find somewhere legal — clear
    * of the anchors, and far enough from the previous threat that they arrive as
    * separate beats — so the *realised* density is lower and its top end is set by that
-   * separation rule rather than by this number. Measured over an 8000m run:
-   *   0-400m 0.00 · 400-1200m 0.54 · 1200-2500m 1.50 · 2500-5000m 1.93 · 5000m+ 2.22
-   * which is the shape DESIGN.md asks for — monotone, asymptotic, tutorial empty — at
-   * roughly one threat every 27 metres once the curve has run out.
+   * separation rule rather than by this number. REALISED density, measured per chunk:
+   *   340-600 0.24 · 600-900 0.94 · 900-1300 1.19 · 1300-1800 1.45 · 1800-2600 1.56
+   *   2600-4000 1.64 · 4000+ 1.68
+   * which is the shape DESIGN.md asks for — monotone, asymptotic, tutorial empty — and
+   * it saturates near 1.7 because PLACEMENT, not this budget, is the binding
+   * constraint. Sweeping HAZ_MAX from 2.2 to 3.4 moved measured survival by less than
+   * the seed-to-seed noise; if you need to change late-game density, the levers that
+   * actually bite are HAZ_CLEAR and the hazard separation rule.
    */
   _hazardBudget(diff, tut) {
     if (tut) return 0;
@@ -1180,6 +1290,13 @@ export class World {
   _genHazards(ci, arch, x0, x1, diff, tut, sp) {
     const budget = this._hazardBudget(diff, tut);
     this.lastHazardCount = 0;
+    // Nothing lethal exists before FIRST_HAZ_X, and the chunk that reaches it is owned
+    // outright by the authored beam — one hazard, alone and legible, instead of a
+    // random first encounter buried in a mix. See CFG.WORLD_FIRST_HAZ_X.
+    if (ci < FIRST_HAZ_CHUNK) return;
+    if (ci === FIRST_HAZ_CHUNK && this._chainN >= 2) {
+      if (this._genFirstLaser(ci)) return;
+    }
     if (budget <= 0) return;
     const x = x0 * 1; // chunk world position drives which kinds have unlocked
     const canDrone = x >= HAZ_DRONE_X;
@@ -1227,6 +1344,41 @@ export class World {
       else if (canDrone && roll > 0.34) kind = 1;
       this._placeGenericHazard(ci, kind, x0, x1, sp);
     }
+  }
+
+  /**
+   * The one hazard in the game that is placed rather than rolled.
+   *
+   * Sits on the mid-span of the longest chain segment in the chunk — the widest, most
+   * open piece of airspace available, so the beam is visible from a long way out and
+   * there is room either side of it. `_emitHazard` derives the duty cycle from
+   * difficulty for normal lasers; this one overrides it afterwards with the far gentler
+   * teaching values, and pins the phase so the beam is DARK when the player is most
+   * likely to arrive rather than leaving that to the hash.
+   *
+   * Returns false if it could not place, in which case the chunk falls through to the
+   * ordinary generator and the next chunk's beam becomes the first one seen. In
+   * practice `_chainN >= 2` is enough for this to always succeed.
+   */
+  _genFirstLaser(ci) {
+    let seg = 0, best = -1;
+    for (let i = 0; i < this._chainN - 1; i++) {
+      const d = CA_X[i + 1] - CA_X[i];
+      if (d > best) { best = d; seg = i; }
+    }
+    const mx = (CA_X[seg] + CA_X[seg + 1]) * 0.5;
+    const my = (CA_Y[seg] + CA_Y[seg + 1]) * 0.5;
+    const h = this._emitHazard(ci, 0, mx, my, FIRST_LASER_HW, 0.34, Math.PI * 0.5);
+    if (!h) return false;
+    h.rate = FIRST_LASER_PERIOD;
+    h.amp = FIRST_LASER_ON;
+    // Phase 0 puts the lethal window at the START of the cycle. The player cannot reach
+    // this beam before ~8s of run time at any speed, which is several full periods, so
+    // what this really buys is determinism: the beam's clock is identical on every seed,
+    // which is what makes it a teachable beat rather than a coin flip.
+    h.phase = 0;
+    this.lastHazardCount = 1;
+    return true;
   }
 
   /** Pick a spot near — but never on top of — the flight line, then emit. */
@@ -1327,7 +1479,7 @@ export class World {
       // (`rate`/`amp`/`phase`), so the dormant window lands at a different point of
       // the sweep for every unit and the field never pulses in lockstep.
       h.per = DRONE_PERIOD;
-      h.duty = DRONE_ON;
+      h.duty = lerp(DRONE_ON_EARLY, DRONE_ON, this._diff);
       h.dphase = hash2(Math.round(x * 8) ^ 0x5bf0, Math.round(y * 8) ^ ci);
     }
     h.chunk = ci;
@@ -1440,7 +1592,8 @@ export class World {
   _genSolids(ci, arch, x0, x1, diff) {
     // Below TUTORIAL_DIST the world must be physically non-lethal: no hazards (already
     // guaranteed) and structure held far enough off the corridor that a new player
-    // cannot hit it. The only way to die in the first 400m is the floodline.
+    // cannot hit it. Architecture stays a pure bounce well past here, out to
+    // SOLID_SAFE_DIST — hazards telegraph and so arrive first; silhouettes do not.
     const tut = x0 < TUT_DIST;
     const clear = tut ? SOLID_CLEAR * SOLID_TUT_MUL : SOLID_CLEAR;
 
@@ -1511,6 +1664,54 @@ export class World {
       this._trySolid(ci, x0 + this._rr(4, 12), this._nearestAnchorY(x0 + 8) - this._rr(14, 24),
         this._rr(4, 9), this._rr(0.6, 1.2), 0, clear, 1);
     }
+
+    // 5. Skim decks — the architecture you are actually allowed to touch.
+    this._genSkimDecks(ci, diff, tut);
+  }
+
+  /**
+   * Gantry decks laid in the SKIM BAND: outside the guaranteed-clear inner envelope,
+   * inside the outer edge of the release-timing envelope. This is the only structure in
+   * the game placed *toward* the player rather than away from them.
+   *
+   * Three properties make this safe to do, and all three are load-bearing:
+   *   1. `_trySolid` still runs the inner-envelope test (style 1 → SAG_BAND), so a deck
+   *      that would intrude on the nominal line is rejected outright. The well-flown
+   *      line stays guaranteed clear — which is what keeps "no death is unavoidable"
+   *      true, and that property is worth more than any amount of texture.
+   *   2. Decks are placed at mid-span (t 0.35–0.65) where the sag envelope is widest and
+   *      the player's velocity is parallel to the chord, and they are ROTATED onto the
+   *      chord. The face you meet therefore runs along your direction of travel, so the
+   *      angle of incidence is shallow by construction and the contact deflects.
+   *   3. Below SOLID_SAFE_DIST they cannot kill at all — a beginner just bounces.
+   */
+  _genSkimDecks(ci, diff, tut) {
+    if (tut || diff <= 0) return;
+    const f = SKIM_MAX * diff;
+    const n = Math.floor(f) + (this._rc(f - Math.floor(f)) ? 1 : 0);
+    for (let k = 0; k < n; k++) {
+      if (this._chainN < 2) return;
+      const seg = this._ri(0, this._chainN - 2);
+      const ax = CA_X[seg], ay = CA_Y[seg];
+      const bx = CA_X[seg + 1], by = CA_Y[seg + 1];
+      const t = this._rr(0.35, 0.65);
+      const bend = Math.sin(t * Math.PI);
+      const cx = lerp(ax, bx, t);
+      const cy = lerp(ay, by, t);
+      // ALWAYS above the chord. Everything below the chain is recovery airspace — the
+      // sag of a bad swing, the catch row, the dive back up out of trouble — and the
+      // floodline already prices sinking. Putting decks down there punished the
+      // mid-skill player hardest (measured: the metronome bot's solid deaths went 6 ->
+      // 14 and it started finishing SHORTER than the hold bot, i.e. the middle of the
+      // skill gradient inverted). Above the chord is where a deliberately late release
+      // throws you, so a deck up there is a consequence of a choice rather than of a
+      // mistake you are already paying for.
+      const y = cy - this._rr(SKIM_NEAR, SKIM_FAR) * bend;
+      const rot = clamp(Math.atan2(by - ay, bx - ax), -0.42, 0.42);
+      this._trySolid(ci, cx + this._rj(3), clamp(y, Y_MIN - 10, FLOODLINE - 3),
+        this._rr(SKIM_HW[0], SKIM_HW[1]), this._rr(SKIM_HH[0], SKIM_HH[1]),
+        rot, SOLID_CLEAR, 1);
+    }
   }
 
   _nearestAnchorY(x) {
@@ -1528,7 +1729,7 @@ export class World {
    * virtual spans that cross the chunk seams), and — near the start of the run — the
    * spawn clear circle and the free-fall corridor leading out of it.
    */
-  _blocksFlight(x, y, hw, hh, rot, lc) {
+  _blocksFlight(x, y, hw, hh, rot, lc, band) {
     // 1. Spawn contract. Only ever relevant for the first ~130 metres.
     if (x - hw - lc < SPAWN_X + SPAWN_CORRIDOR + 12 && x + hw + lc > SPAWN_X - 40) {
       if (circleVsOBB(SPAWN_X, SPAWN_Y, SPAWN_CLEAR_R, x, y, hw, hh, rot)) return true;
@@ -1573,27 +1774,39 @@ export class World {
         const px = lerp(ax, bx, t);
         const base = lerp(ay, by, t);
         const bend = Math.sin(t * Math.PI);
-        for (let g = 0; g < SAG_BAND.length; g++) {
-          if (circleVsOBB(px, base + SAG_BAND[g] * bend, lc, x, y, hw, hh, rot)) return true;
+        for (let g = 0; g < band.length; g++) {
+          if (circleVsOBB(px, base + band[g] * bend, lc, x, y, hw, hh, rot)) return true;
         }
       }
     }
     return false;
   }
 
+  /**
+   * `style` 1 is a DECK (catwalk / gantry floor): long, flat, horizontal, and therefore
+   * only ever meetable at a shallow angle, so it is cleared against the inner envelope
+   * and may sit inside the outer one. Every other style is a hard face and is cleared
+   * against the whole envelope. See SAG_BAND / SAG_BAND_FULL.
+   */
   _trySolid(ci, x, y, hw, hh, rot, clear, style) {
     if (this._chunkS >= PER_CHUNK_S) return null;
     // Clearance vs anchors.
     for (let i = 0; i < this._chunkN; i++) {
       if (circleVsOBB(CA_X[i], CA_Y[i], clear, x, y, hw, hh, rot)) return null;
     }
-    const lc = Math.max(3, clear * (SOLID_LINE_CLEAR / SOLID_CLEAR));
-    if (this._blocksFlight(x, y, hw, hh, rot, lc)) return null;
+    const deck = style === 1;
+    const lc = deck ? SKIM_LC : Math.max(3, clear * (SOLID_LINE_CLEAR / SOLID_CLEAR));
+    const band = deck ? SAG_BAND : SAG_BAND_FULL;
+    if (this._blocksFlight(x, y, hw, hh, rot, lc, band)) return null;
     const s = this._pSolid.alloc();
     if (!s) { this.poolMisses++; return null; }
     s.x = x; s.y = y; s.hw = hw; s.hh = hh; s.rot = rot;
     s.chunk = ci; s.style = style;
     s.sign = this._rc(0.22) ? 1 : 0;
+    // Pooled: never inherit the last tenant's cooldowns. Anchors and hazards already
+    // did this; solids did not, so a recycled slab could spawn with a live graze
+    // cooldown and silently swallow the player's first skim of it.
+    s._grazeCd = 0; s._deflectCd = 0;
     this._chunkS++;
     return s;
   }
@@ -1618,7 +1831,7 @@ export class World {
    * extent (glowRadius is ignored for that shape), so haloes are sized in world units
    * directly — a couple of anchor radii, never a screenful.
    */
-  render(r, camX, viewW, zoom, time) {
+  render(r, camX, viewW, zoom, time, flood01 = 0) {
     const pad = viewW * CULL_PAD;
     const lo = camX - pad, hi = camX + pad;
     const aa = 1.6 / (zoom > 1e-4 ? zoom : 1);
@@ -1628,8 +1841,86 @@ export class World {
     pc += this._renderOrbs(r, lo, hi, aa, time);
     pc += this._renderHazards(r, lo, hi, aa, time);
     pc += this._renderAnchors(r, lo, hi, aa, time, pc);
+    pc += this._renderFloodline(r, lo, hi, aa, time, flood01);
 
     this.debugCount = pc;
+  }
+
+  /**
+   * THE FLOODLINE ALARM.
+   *
+   * Drowning was the only lethal thing in the game with nothing that could be called
+   * a tell. A hazard announces itself twice — a 0.4s charge-up plus 0.83s of median
+   * on-screen presence — while the water announced itself with a vignette ramped over
+   * 13 units and squared, i.e. 0.17s at the descent rate people actually drown at.
+   * That is not a hard mechanic, it is an invisible one, and it was killing the mid
+   * tier in 31% of runs.
+   *
+   * The vignette in main.js is now the SLOW half of the telegraph (a 55u cubic ramp).
+   * This is the fast half, and it is deliberately in a different visual channel:
+   *
+   *   - It is ON THE OBJECT. The vignette is a screen-edge wash, which reads as "the
+   *     game is unhappy"; this draws the actual thing that is about to kill you, at
+   *     the actual place it will happen, which is what makes the danger locatable.
+   *   - It BEATS, and the beat ACCELERATES from FLOOD_WARN_HZ[0] to [1] as you sink.
+   *     Rhythm survives peripheral vision and a noisy frame in a way that a
+   *     brightness ramp does not, and an accelerating rhythm communicates "closing"
+   *     without a number. It is the same grammar as the laser's blink — the tell the
+   *     game has already taught by this point — so it needs no new lesson.
+   *   - It is MAGENTA, per DESIGN.md's colour contract: magenta blinks, magenta
+   *     kills. The water is the only lethal surface that used to break that rule.
+   *
+   * Costs a normally-flying player exactly nothing: `k` is gated on flood01, which is
+   * zero for anyone who is not already 55 units into the bottom of the corridor, and
+   * the cubic on the bar intensity keeps even the top of the band nearly dark. The
+   * whole thing is 3 primitives and only while it is audible at all.
+   */
+  _renderFloodline(r, lo, hi, aa, time, flood01) {
+    if (flood01 <= 0.02) return 0;
+    const k = flood01;
+    const kk = k * k;
+
+    // Accelerating beat. Phase is integrated so the rate can change without the
+    // pulse jumping — a discontinuity here would read as a dropped frame, not urgency.
+    const hz = FLOOD_HZ0 + (FLOOD_HZ1 - FLOOD_HZ0) * kk;
+    // Clamped: the alarm is usually dormant for many seconds at a stretch, so the
+    // first frame after it re-arms would otherwise integrate the whole gap.
+    const fdt = clamp(time - this._floodTime, 0, 0.1);
+    this._floodPhase = (this._floodPhase + hz * fdt) % 1;
+    this._floodTime = time;
+    // Sharpened sine: a sawtooth-ish attack reads as a STROBE rather than a throb.
+    const beat = Math.pow(0.5 + 0.5 * Math.sin(this._floodPhase * TAU), 3);
+    const pulse = 0.35 + 0.65 * beat;
+
+    const cx = (lo + hi) * 0.5, hw = (hi - lo) * 0.5;
+    const y = FLOODLINE;
+    let pc = 0;
+
+    // The surface itself: a hard magenta line the full width of the view. This is the
+    // element that says WHERE, and it is the one that was missing entirely.
+    tint(SC0, PAL.magentaHot, (0.10 + 0.85 * kk) * pulse, 1);
+    r.line(LAYER.NEON, cx - hw, y, cx + hw, y, 0.22 + 0.5 * k, SC0,
+      { glow: 0.8 + 1.4 * k, glowRadius: 0.8 + 2.2 * k, soft: aa });
+    pc++;
+
+    // Haze lifting off the water. Sits ABOVE the line so it occupies the space the
+    // player is falling through, which is where the eye already is.
+    tint(SC1, PAL.magentaHot, 0.05 + 0.22 * kk * pulse, 1);
+    r.rect(LAYER.FAR_GLOW, cx, y - 5.5 * k, hw, 5.5 * k, 0, SC1,
+      { glow: 0.9, glowRadius: 3.0, soft: aa * 6 });
+    pc++;
+
+    // Last-ditch: inside the final third the surface throws a wide flare on every
+    // beat. By here the vignette is also up, so the two channels agree and the read
+    // is unambiguous — this is the frame that should feel like an alarm, not a mood.
+    if (k > 0.62) {
+      const kf = (k - 0.62) / 0.38;
+      tint(SC2, PAL.magentaHot, 0.30 * kf * pulse, 1);
+      r.line(LAYER.NEON, cx - hw, y, cx + hw, y, 2.4 + 3.0 * kf, SC2,
+        { glow: 1.6, glowRadius: 4.0, soft: aa * 4 });
+      pc++;
+    }
+    return pc;
   }
 
   // ---- structure ----------------------------------------------------------------

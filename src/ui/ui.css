@@ -300,17 +300,34 @@ body {
 .hud-mult.break-a { animation: mult-break-a 220ms cubic-bezier(.3,.0,.7,.2) both; }
 .hud-mult.break-b { animation: mult-break-b 220ms cubic-bezier(.3,.0,.7,.2) both; }
 
-/* ---- charge meter (right edge) ------------------------------------------- */
-.hud-charge {
+/* ---- THE POWER COLUMN (right edge) ---------------------------------------
+   O/D ring stacked directly on top of the CHARGE track. One economy, one column,
+   one eye fixation. See the comment in hud.js — the ring used to live in the
+   top-left corner and the bar on the right edge, which made a single currency
+   look like two unrelated widgets and put the 100% hand-off across the screen.
+
+   The ring's 58px box is reserved whether or not overdrive is up, so the charge
+   track never moves: a meter that shifts position at 100% is exactly the wrong
+   frame to introduce a layout change into. */
+.hud-power {
   position: absolute;
   right: calc(var(--sar) + 12px);
   top: 50%;
   transform: translate3d(0, -50%, 0);
+  width: 58px;
+  height: min(52vh, 446px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.hud-charge {
   /* Wide enough for the label to sit horizontally above the track. The track
      stays hard against the right edge via flex-end, so the meter itself has not
      moved a pixel — only the label's reading direction has. */
   width: 44px;
-  height: min(46vh, 380px);
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
@@ -413,12 +430,15 @@ body {
   transition: opacity 180ms ease;
 }
 
+/* Sits at the TOP of the power column, immediately above the charge track it
+   drains out of. `position: relative` (not absolute) so it holds its slot in the
+   flex column and the track below it never reflows when overdrive starts. */
 .hud-od {
-  position: absolute;
-  top: calc(var(--sat) + 12px);
-  left: calc(var(--sal) + 14px);
+  position: relative;
+  flex: 0 0 auto;
   width: 58px;
   height: 58px;
+  margin-bottom: 8px;
   opacity: 0;
   transform: scale3d(0.7, 0.7, 1);
   transition: opacity 200ms ease, transform 240ms cubic-bezier(.2,.9,.25,1);
@@ -457,6 +477,74 @@ body {
   letter-spacing: 0.14em;
   color: var(--hot);
   text-shadow: 0 0 10px var(--cyan);
+}
+
+/* ---------------------------------------------------------------------------
+   OVERDRIVE EXIT WINDOW
+   The last OVERDRIVE_EXIT_WINDOW seconds, where a perfect arc becomes the exit and
+   banks a refund that scales with how late you cut it. That is a real L5 decision and
+   it was previously discoverable only by inference — the ring drained, and nothing
+   said the last sliver of it meant something different from the rest.
+
+   The cue used to be ONLY on the overdrive ring, on the reasoning that the ring is
+   what the eye is on while overdrive is up. It is not. The thing the player is actually
+   watching is the collapsing amber cue drawn ON THE AVATAR — and the ring was a 58px
+   badge in the opposite corner of the screen. That asked for a 1.2-second state read
+   from the periphery during the noisiest visual state in the game, which is a cue
+   delivered where the eye is not.
+
+   It is now carried in two places that cannot both be missed:
+     - the ring (moved into the power column, see .hud-power): arc goes amber — the
+       game's reward hue, the same colour as the arc popups you are being asked to
+       produce — thickens, beats at ~3.3Hz, and the label swaps O/D -> ARC. Amber
+       against the cyan/white-hot of overdrive is the largest hue separation in the
+       palette, so it reads as a state change rather than as a continuation of the drain.
+     - .hud-exitrim: a full-bleed amber rim on the same beat. This one is the point —
+       a rim has no location, so it is legible with the eye parked dead centre on the
+       avatar, which is where it actually is. It FRAMES the avatar cue rather than
+       competing with it.
+   No new input, no new screen furniture, and neither can be confused with the
+   charge-full pulse: that one is cyan/violet and is suppressed for all of overdrive.
+   --------------------------------------------------------------------------- */
+@keyframes od-exit-beat {
+  0%, 100% { transform: scale3d(1, 1, 1); }
+  50%      { transform: scale3d(1.14, 1.14, 1); }
+}
+.hud-root.is-odexit .hud-od {
+  animation: od-exit-beat 300ms ease-in-out infinite;
+}
+.hud-root.is-odexit .hud-od-arc {
+  stroke: var(--amber);
+  stroke-width: 5;
+  filter: drop-shadow(0 0 10px rgba(255, 176, 32, 1));
+}
+.hud-root.is-odexit .hud-od-label {
+  color: var(--amber);
+  text-shadow: 0 0 3px rgba(4, 3, 12, 1), 0 0 12px var(--amber);
+}
+/* The rim. Deliberately thinner and dimmer than .hud-fullglow: CHARGE FULL is a
+   "you have earned something" event and is allowed to shout, whereas this is a
+   1.2s window inside an already-bleached frame and only has to say WHEN, not WHAT. */
+.hud-exitrim {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  box-shadow:
+    inset 0 0 0 2px rgba(255, 176, 32, 0.65),
+    inset 0 0 54px rgba(255, 176, 32, 0.42);
+  will-change: opacity;
+}
+@keyframes od-exit-rim {
+  0%, 100% { opacity: 0.20; }
+  50%      { opacity: 0.85; }
+}
+.hud-root.is-odexit .hud-exitrim { animation: od-exit-rim 300ms ease-in-out infinite; }
+
+/* Reduced motion: keep the colour + weight change, drop the beat. The cue must still
+   exist — it is mechanically load-bearing, not decoration. */
+@media (prefers-reduced-motion: reduce) {
+  .hud-root.is-odexit .hud-od { animation: none !important; transform: scale3d(1.1, 1.1, 1); }
+  .hud-root.is-odexit .hud-exitrim { animation: none !important; opacity: 0.7; }
 }
 
 /* Animated edge streaks running down the screen borders during overdrive. */
@@ -616,10 +704,15 @@ body {
   color: var(--amber);
   text-shadow: 0 0 4px rgba(255,255,255,0.55), 0 0 16px var(--amber);
 }
-/* Grazing is the L3 skill layer and the primary CHARGE source; it was 11px cyan
-   at ~8% effective contrast (a `filter: opacity()` stacked on top of the
-   keyframe's own opacity). Amber separates it from the cyan world it is drawn
-   over, and nothing dims it twice any more. */
+/* Grazing is the L3 skill layer; it was 11px cyan at ~8% effective contrast (a
+   `filter: opacity()` stacked on top of the keyframe's own opacity). Amber
+   separates it from the cyan world it is drawn over, and nothing dims it twice
+   any more.
+   This used to claim grazing was "the primary CHARGE source". It never was, and
+   after the graze rebalance it is not close: perfect arcs supply ~70% of charge
+   and hazard grazes ~14%. What grazing owns is not volume but RISK — with
+   GRAZE_ANCHORS off, every graze is now something that could have killed you,
+   which is what DESIGN.md's "risk = reward" actually promised. */
 .pop--graze .pop-i {
   --rise: 42px;
   font-size: 14px;

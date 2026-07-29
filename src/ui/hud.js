@@ -3,7 +3,7 @@
 // Contract (CONTRACTS.md):
 //   new Hud(root)                          root = <div id="hud">
 //   update(state)                          { distance, score, multiplier, charge01,
-//                                            overdrive01, alive, speed01,
+//                                            overdrive01, odExit, alive, speed01,
 //                                            menu, holding }
 //   popup(kind, text, screenX, screenY)    kind: 'perfect'|'graze'|'orb'|'combo'
 //   reset()
@@ -126,6 +126,21 @@ export class Hud {
     top.appendChild(this.multEl = div('hud-mult', ''));
     el.appendChild(top);
 
+    // ---- THE POWER COLUMN ------------------------------------------------
+    // CHARGE and OVERDRIVE are two halves of ONE economy — you fill the meter,
+    // the meter becomes the ring, the ring drains, the ring refunds into the
+    // meter — and they used to be drawn 350px apart, the bar on the right edge
+    // and the ring in the top-left corner. Nothing about the layout said they
+    // were the same currency, so the hand-off (bar hits 100%, bar vanishes, ring
+    // appears somewhere else entirely) read as two unrelated widgets rather than
+    // as one state change.
+    //
+    // They now share one column against the right edge, ring directly above the
+    // track it drains out of. The bar fills UPWARD toward the ring, so the
+    // geometry itself states the relationship, and the hand-off happens within
+    // one eye fixation instead of across the whole screen.
+    const power = div('hud-power');
+
     // Overdrive countdown ring. SVG so the drain is a stroke-dashoffset write,
     // which repaints a 58px box and never touches layout. Built node-by-node
     // rather than via innerHTML — no namespace ambiguity, no querySelector.
@@ -136,8 +151,8 @@ export class Hud {
     svg.appendChild(ring('hud-od-bg'));
     svg.appendChild(this.odArc = ring('hud-od-arc'));
     od.appendChild(svg);
-    od.appendChild(div('hud-od-label', 'O/D'));
-    el.appendChild(this.odEl = od);
+    od.appendChild(this.odLabel = div('hud-od-label', 'O/D'));
+    power.appendChild(this.odEl = od);
 
     // Charge meter. Label goes FIRST — set horizontally above the track, not
     // rotated beside it. A vertical label read top-to-bottom against a meter that
@@ -148,7 +163,19 @@ export class Hud {
     track.appendChild(this.chargeFill = div('hud-charge-fill'));
     track.appendChild(div('hud-charge-ticks'));
     charge.appendChild(track);
-    el.appendChild(charge);
+    power.appendChild(charge);
+    el.appendChild(power);
+
+    // Exit-window rim. The ring cue is a 58px badge, and during the exit window
+    // the player is looking at the AVATAR — the collapsing amber cue drawn on the
+    // player is the thing they are actually reading. Asking for a 1.2s state read
+    // from screen furniture, during the noisiest visual state in the game, loses.
+    // This is the half of that fix the HUD can own: a full-bleed amber rim, so the
+    // cue exists in peripheral vision NO MATTER where the eye is parked, and it
+    // frames the avatar rather than competing with it. Same trick as .hud-fullglow,
+    // different hue, and the two can never run at once (charge-full is suppressed
+    // for the whole of overdrive).
+    el.appendChild(this.exitRim = div('hud-exitrim'));
 
     // First-run prompt. The entire control scheme is one verb, and nothing on
     // screen says it. Shown until the player's first touch-down, ever.
@@ -201,6 +228,7 @@ export class Hud {
     this._mult = -1;
     this._charge = -1;
     this._chargeFull = false;
+    this._odExit = false;
     this._od = -1;
     this._odOn = false;
     this._alive = true;
@@ -220,7 +248,7 @@ export class Hud {
   // ---------------------------------------------------------------- update --
   /**
    * @param {{distance:number,score:number,multiplier:number,charge01:number,
-   *          overdrive01:number,alive:boolean,speed01:number,
+   *          overdrive01:number,odExit:boolean,alive:boolean,speed01:number,
    *          menu?:boolean,holding?:boolean}} s
    * Hot path. Every branch below early-outs on an unchanged quantised value, so
    * a steady frame costs a handful of integer compares and nothing else.
@@ -332,6 +360,20 @@ export class Hud {
       }
     }
 
+    // --- overdrive EXIT WINDOW -------------------------------------------
+    // The last stretch of overdrive, where a perfect arc becomes a deliberate exit
+    // and banks a refund scaled by how late you take it. This is an L5 decision and
+    // it needs a cue, or the only way to learn the window exists is to trip over it.
+    // main.js owns the boundary (it knows the raw seconds remaining); the HUD just
+    // reflects it, so the two can never disagree about where the window starts.
+    const exit = !!s.odExit;
+    if (exit !== this._odExit) {
+      this._odExit = exit;
+      this.el.classList.toggle('is-odexit', exit);
+      // O/D -> ARC: the label stops naming the state and starts naming the verb.
+      this.odLabel.textContent = exit ? 'ARC' : 'O/D';
+    }
+
     // --- speed tier: a single class flip driving a hotter headline glow.
     //     Asymmetric thresholds (0.78 in, 0.68 out) give it hysteresis so it
     //     cannot chatter on and off frame-to-frame around the boundary.
@@ -437,6 +479,9 @@ export class Hud {
     this._mult = 1;
     this._charge = 0;
     this._chargeFull = false;
+    this._odExit = false;
+    this.el.classList.remove('is-odexit');
+    this.odLabel.textContent = 'O/D';
     this._od = 0;
     this._odOn = false;
     this._alive = true;

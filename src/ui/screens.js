@@ -5,7 +5,8 @@
 //   showTitle(); showGameOver(stats); hide();
 //   get visible()
 //
-// stats: { distance, score, best, bestDistance, multiplierPeak, perfects, isNewBest }
+// stats: { distance, score, best, bestDistance, multiplierPeak, perfects,
+//          hazardGrazes, overdrives, isNewBest }
 //
 // Notes on touch:
 //   * The root and the TITLE container are `pointer-events: none`. Gameplay
@@ -21,9 +22,17 @@
 //     as the WebAudio unlock gesture; a `click` fallback is deduped by
 //     timestamp for browsers without PointerEvent.
 
-/** localStorage keys. Read defensively — private browsing throws on access. */
-const LS_BEST = 'arclight.best';
-const LS_BEST_DIST = 'arclight.bestDistance';
+/** localStorage keys. Read defensively — private browsing throws on access.
+ *
+ *  The `.s2` suffix is an ECONOMY EPOCH, not a schema version, and it must be bumped
+ *  by anyone who changes what a point is worth. The pacing/graze/overdrive rebalance
+ *  cut a median smart run from ~105k to ~45k — honest deflation (most of it was an
+ *  unloseable warm-up being deleted), but a returning player would have inherited a
+ *  personal best from the old economy that the new one cannot reach, turning the one
+ *  number on the title screen into a permanent loss. A best is only meaningful
+ *  against the rules that produced it. Must match main.js. */
+const LS_BEST = 'arclight.best.s2';
+const LS_BEST_DIST = 'arclight.bestDistance.s2';
 const LS_AUDIO = 'arclight.audio';
 
 /** Count-up tween length and per-row stagger, ms. */
@@ -175,6 +184,20 @@ export class Screens {
     panel.appendChild(statRow(this, 'SCORE', 'score', false, ''));
     panel.appendChild(statRow(this, 'PEAK MULT', 'mult', false, ''));
     panel.appendChild(statRow(this, 'PERFECT ARCS', 'perf', false, ''));
+    // The two acts the CHARGE economy is actually made of, reported side by side.
+    // Perfect arcs are ~70% of the meter by volume; a hazard graze is the single
+    // biggest deposit in the game and the only reward you can only collect by being
+    // close enough to die. Naming it here is what teaches L3 — the popup during a run
+    // goes past too fast to price.
+    panel.appendChild(statRow(this, 'HAZARD GRAZES', 'hgraze', false, ''));
+    // OVERDRIVE. The showpiece of the game — six seconds of double score,
+    // invulnerability and time dilation — went completely unnamed here, despite
+    // firing in 77% / 40% / 23% of runs across the three skill tiers. The report is
+    // the only place in the game that prices a run after the fact, and the one
+    // mechanic the whole CHARGE economy exists to deliver was the one thing it did
+    // not mention. It reads 0 for a player who never earned one, which is the point:
+    // a named zero is an aspiration, an absent row is nothing at all.
+    panel.appendChild(statRow(this, 'OVERDRIVE', 'od', false, ''));
     panel.appendChild(statRow(this, 'BEST', 'best', false, ''));
     body.appendChild(panel);
     scr.appendChild(body);
@@ -214,7 +237,8 @@ export class Screens {
   }
 
   /** @param {{distance:number,score:number,best:number,bestDistance:number,
-   *           multiplierPeak:number,perfects:number,isNewBest:boolean}} stats */
+   *           multiplierPeak:number,perfects:number,hazardGrazes:number,
+   *           overdrives:number,isNewBest:boolean}} stats */
   showGameOver(stats) {
     const s = stats || {};
     this._absorbBest(s);
@@ -241,6 +265,8 @@ export class Screens {
       Math.max(0, s.score || 0),
       Math.max(1, s.multiplierPeak || 1),
       Math.max(0, s.perfects || 0),
+      Math.max(0, s.hazardGrazes || 0),
+      Math.max(0, s.overdrives || 0),
       Math.max(0, s.best || this._best || 0)
     );
   }
@@ -274,15 +300,18 @@ export class Screens {
   }
 
   // ----------------------------------------------------------- count-up ----
-  _startTween(distance, score, mult, perfects, best) {
+  _startTween(distance, score, mult, perfects, hazardGrazes, overdrives, best) {
     const rows = this.rows;
     const t0 = performance.now();
     const total = TWEEN_MS + TWEEN_STAGGER * (rows.length - 1);
 
-    // Targets in row order: dist, score, mult, perf, best.
-    const targets = this._targets || (this._targets = new Float64Array(5));
+    // Targets in row order: dist, score, mult, perf, hazard grazes, overdrive, best.
+    // Length is asserted against the row list rather than hardcoded, so adding a row
+    // above without adding a target here cannot silently tween it to zero.
+    const targets = this._targets || (this._targets = new Float64Array(7));
     targets[0] = distance; targets[1] = score; targets[2] = mult;
-    targets[3] = perfects; targets[4] = best;
+    targets[3] = perfects; targets[4] = hazardGrazes; targets[5] = overdrives;
+    targets[6] = best;
 
     rows[2].mult = true;                       // PEAK MULT prints ×N, not N
     // Seed at the floor so the first painted frame is not the final number.
