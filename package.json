@@ -1,0 +1,14 @@
+{
+  "name": "arclight",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A one-thumb neon traversal game for iPhone Safari.",
+  "scripts": {
+    "start": "node server.js",
+    "probe": "node tools/probe.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.0"
+  }
+}

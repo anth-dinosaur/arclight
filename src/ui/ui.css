@@ -1,0 +1,1018 @@
+/* =============================================================================
+   ARCLIGHT — interface stylesheet
+   Owner: UI agent. Covers base/reset, #gl, #hud and #screens.
+
+   Rules of engagement:
+   - Only transforms / opacity / filters are animated. Nothing here animates
+     width / height / top / left, so the compositor keeps everything off the
+     main thread. iOS Safari will happily drop to 20fps if you animate layout.
+   - Containers are `pointer-events: none`. ONLY real buttons opt back in.
+     A full-screen `pointer-events: auto` would swallow every gameplay touch.
+   - System fonts only. No @import, no webfont fetch, no layout shift on load.
+   - Palette mirrors `PAL` in src/core/config.js.
+   ========================================================================== */
+
+/* ---------------------------------------------------------------- tokens -- */
+:root {
+  /* Palette — matches PAL / the DESIGN.md table exactly. */
+  --void:      #04030c;
+  --deep:      #0a0a1f;
+  --cyan:      #22f0ff;
+  --magenta:   #ff2d95;
+  --violet:    #8b5cf6;
+  --amber:     #ffb020;
+  --hot:       #eaffff;
+
+  /* Derived inks. Kept as separate tokens so the glow strength is tunable. */
+  --ink:       #cfe9f2;
+  --ink-dim:   #6f8ba0;
+  --rule:      rgba(34, 240, 255, 0.16);
+  --rule-soft: rgba(34, 240, 255, 0.07);
+
+  /* Safe area. Absolutely-positioned children ignore an ancestor's padding,
+     so every edge-anchored element consumes these directly. */
+  --sat: env(safe-area-inset-top, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+
+  /* Type. System stacks only — zero network cost, no FOUT. */
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
+        "Helvetica Neue", Arial, sans-serif;
+
+  /* Live HUD channels, written from JS. Declared here so the cascade always
+     has a sane starting value even before the first update(). */
+  --mult-col: var(--cyan);
+  --od: 0;
+}
+
+/* ----------------------------------------------------------------- reset -- */
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--void);
+  color: var(--ink);
+  font-family: var(--ui);
+  overflow: hidden;
+  overscroll-behavior: none;          /* kill rubber-band / pull-to-refresh */
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  /* position:fixed + inset:0 is the reliable iOS Safari way to stop the
+     document itself from scrolling or bouncing under the canvas. */
+  position: fixed;
+  inset: 0;
+  touch-action: none;                 /* no pan, no pinch, no double-tap zoom */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --------------------------------------------------------------- surface -- */
+#gl {
+  position: fixed;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100vh;                      /* fallback for older iOS */
+  height: 100dvh;                     /* dynamic viewport: no jump on toolbar */
+  background: var(--void);
+  touch-action: none;
+  z-index: 0;
+}
+
+#hud,
+#screens {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  pointer-events: none;               /* NEVER set this to auto */
+  touch-action: none;
+  overflow: hidden;
+  contain: layout style;
+}
+#hud     { z-index: 10; }
+#screens { z-index: 20; }
+
+.noscript {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--cyan);
+  font-family: var(--mono);
+  letter-spacing: 0.2em;
+  z-index: 99;
+}
+
+/* =============================================================================
+   HUD
+   ========================================================================== */
+.hud-root {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 260ms ease;
+  will-change: opacity;
+}
+.hud-root.is-on  { opacity: 1; }
+.hud-root.is-dead { opacity: 0.35; }
+
+/* ---- headline readout (top centre) --------------------------------------- */
+.hud-top {
+  position: absolute;
+  top: calc(var(--sat) + 10px);
+  left: 50%;
+  transform: translate3d(-50%, 0, 0);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.hud-dist {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  line-height: 0.94;
+}
+
+.hud-dist-val {
+  font-family: var(--mono);
+  /* Tabular figures + a fixed character box: digits can never reflow the row. */
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: "tnum" 1, "lnum" 1;
+  font-weight: 700;
+  font-size: clamp(42px, 15.5vw, 78px);
+  letter-spacing: -0.01em;
+  min-width: 4ch;                     /* reserved width; never re-measured */
+  text-align: right;
+  color: var(--hot);
+  text-shadow:
+    0 0 2px rgba(234, 255, 255, 0.9),
+    0 0 18px rgba(34, 240, 255, 0.55),
+    0 0 46px rgba(34, 240, 255, 0.22);
+}
+
+.hud-dist-unit {
+  font-family: var(--mono);
+  font-size: clamp(13px, 4vw, 19px);
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  margin-left: 0.36em;
+  color: var(--cyan);
+  opacity: 0.72;
+  text-shadow: 0 0 10px rgba(34, 240, 255, 0.5);
+}
+
+/* Thin technical rule under the headline — pure decoration, sells the genre. */
+/* At high speed the headline gets hotter. One class flip, hysteresis in JS. */
+.hud-root.is-fast .hud-dist-val {
+  text-shadow:
+    0 0 3px rgba(255, 255, 255, 1),
+    0 0 26px rgba(34, 240, 255, 0.8),
+    0 0 70px rgba(139, 92, 246, 0.4);
+}
+
+.hud-rule {
+  width: 132px;
+  height: 1px;
+  margin: 5px 0 4px;
+  background: linear-gradient(90deg,
+    transparent, var(--rule), rgba(34, 240, 255, 0.5), var(--rule), transparent);
+}
+
+.hud-score {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+}
+.hud-score-label {
+  font-size: 9px;
+  letter-spacing: 0.34em;
+  color: var(--ink-dim);
+}
+.hud-score-val {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: 0.06em;
+  color: var(--ink);
+  text-shadow: 0 0 12px rgba(34, 240, 255, 0.28);
+}
+
+/* ---- multiplier ---------------------------------------------------------- */
+.hud-mult {
+  margin-top: 9px;
+  padding: 3px 11px 3px 12px;
+  font-family: var(--mono);
+  font-size: 21px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  line-height: 1;
+  color: var(--mult-col);
+  border: 1px solid currentColor;
+  /* Angled corner: the cheap, instantly-readable "expensive UI" cue. */
+  clip-path: polygon(9px 0, 100% 0, 100% calc(100% - 9px), calc(100% - 9px) 100%, 0 100%, 0 9px);
+  background: rgba(4, 3, 12, 0.42);
+  text-shadow: 0 0 14px currentColor;
+  /* drop-shadow, not box-shadow: clip-path would crop a box-shadow, but a
+     filter is applied AFTER clipping so the halo follows the notched shape. */
+  filter: drop-shadow(0 0 9px currentColor);
+  opacity: 0;
+  transform: translate3d(0, -6px, 0) scale(0.7);
+  transition: opacity 160ms ease, transform 160ms ease;
+  will-change: transform, opacity;
+}
+.hud-mult.is-on {
+  opacity: 1;
+  transform: translate3d(0, 0, 0) scale(1);
+}
+
+/* Two identical keyframe tracks under different names. Swapping between them
+   restarts the spring without a forced reflow (`offsetWidth` read) — that
+   reflow is the classic source of iOS hitching. */
+@keyframes mult-spring-a {
+  0%   { transform: translate3d(0,0,0) scale(1); }
+  22%  { transform: translate3d(0,0,0) scale(1.42); }
+  46%  { transform: translate3d(0,0,0) scale(0.93); }
+  70%  { transform: translate3d(0,0,0) scale(1.08); }
+  100% { transform: translate3d(0,0,0) scale(1); }
+}
+@keyframes mult-spring-b {
+  0%   { transform: translate3d(0,0,0) scale(1); }
+  22%  { transform: translate3d(0,0,0) scale(1.42); }
+  46%  { transform: translate3d(0,0,0) scale(0.93); }
+  70%  { transform: translate3d(0,0,0) scale(1.08); }
+  100% { transform: translate3d(0,0,0) scale(1); }
+}
+.hud-mult.spring-a { animation: mult-spring-a 460ms cubic-bezier(.2,.9,.25,1); }
+.hud-mult.spring-b { animation: mult-spring-b 460ms cubic-bezier(.2,.9,.25,1); }
+
+/* ---- charge meter (right edge) ------------------------------------------- */
+.hud-charge {
+  position: absolute;
+  right: calc(var(--sar) + 12px);
+  top: 50%;
+  transform: translate3d(0, -50%, 0);
+  width: 16px;
+  height: min(46vh, 380px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.hud-charge-track {
+  position: relative;
+  flex: 1 1 auto;
+  width: 6px;
+  border: 1px solid var(--rule);
+  background: rgba(34, 240, 255, 0.05);
+  overflow: hidden;
+}
+
+/* Filled by scaleY from the bottom. `width` is never touched. */
+.hud-charge-fill {
+  position: absolute;
+  inset: 0;
+  transform-origin: 50% 100%;
+  transform: scale3d(1, 0, 1);
+  background: linear-gradient(180deg, var(--hot) 0%, var(--cyan) 26%, var(--violet) 100%);
+  box-shadow: 0 0 12px rgba(34, 240, 255, 0.85);
+  will-change: transform;
+}
+
+/* Tick marks at 25/50/75%. Static, no repaint cost. */
+.hud-charge-ticks {
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(180deg,
+    transparent 0 24.6%, rgba(4,3,12,.9) 24.6% 25.4%,
+    transparent 25.4% 49.6%, rgba(4,3,12,.9) 49.6% 50.4%,
+    transparent 50.4% 74.6%, rgba(4,3,12,.9) 74.6% 75.4%,
+    transparent 75.4% 100%);
+}
+
+.hud-charge-label {
+  margin-top: 7px;
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--ink-dim);
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  opacity: 0.7;
+}
+
+/* CHARGE FULL — full-bleed edge glow pulse. Unmissable by design. */
+.hud-fullglow {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  /* A hairline hot rim plus two deep inset washes: reads as the whole screen
+     being rimlit, which is the point — 100% charge must be impossible to miss. */
+  box-shadow:
+    inset 0 0 0 2px rgba(234, 255, 255, 0.55),
+    inset 0 0 70px rgba(34, 240, 255, 0.7),
+    inset 0 0 190px rgba(139, 92, 246, 0.45);
+  will-change: opacity;
+}
+@keyframes full-pulse {
+  0%, 100% { opacity: 0.28; }
+  50%      { opacity: 1; }
+}
+.hud-root.is-full .hud-fullglow { animation: full-pulse 620ms ease-in-out infinite; }
+.hud-root.is-full .hud-charge-fill { box-shadow: 0 0 26px rgba(234, 255, 255, 1); }
+.hud-root.is-full .hud-charge-track { border-color: rgba(234, 255, 255, 0.75); }
+
+/* ---- overdrive ----------------------------------------------------------- */
+/* The whole HUD shifts hot white-cyan. Filter is compositor-friendly. */
+.hud-root.is-od .hud-top,
+.hud-root.is-od .hud-charge {
+  filter: brightness(1.55) saturate(0.55) drop-shadow(0 0 16px rgba(234, 255, 255, 0.85));
+}
+.hud-root.is-od .hud-dist-val { color: #ffffff; }
+
+.hud-od {
+  position: absolute;
+  top: calc(var(--sat) + 12px);
+  left: calc(var(--sal) + 14px);
+  width: 58px;
+  height: 58px;
+  opacity: 0;
+  transform: scale3d(0.7, 0.7, 1);
+  transition: opacity 200ms ease, transform 240ms cubic-bezier(.2,.9,.25,1);
+  will-change: transform, opacity;
+}
+.hud-root.is-od .hud-od { opacity: 1; transform: scale3d(1, 1, 1); }
+
+.hud-od svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.hud-od-bg {
+  fill: none;
+  stroke: rgba(234, 255, 255, 0.16);
+  stroke-width: 3;
+}
+.hud-od-arc {
+  fill: none;
+  stroke: var(--hot);
+  stroke-width: 3;
+  stroke-linecap: round;
+  /* r = 24 -> circumference 150.796. dashoffset is driven from JS; it repaints
+     but never reflows. */
+  stroke-dasharray: 150.796;
+  stroke-dashoffset: 0;
+  transform: rotate(-90deg);            /* start the drain at 12 o'clock */
+  transform-box: view-box;
+  transform-origin: 29px 29px;
+  filter: drop-shadow(0 0 6px rgba(34, 240, 255, 0.9));
+}
+.hud-od-label {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--hot);
+  text-shadow: 0 0 10px var(--cyan);
+}
+
+/* Animated edge streaks running down the screen borders during overdrive. */
+.hud-edges {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+.hud-root.is-od .hud-edges { opacity: 1; }
+
+.hud-edge {
+  position: absolute;
+  background: linear-gradient(180deg,
+    transparent, rgba(234,255,255,0.05) 18%, var(--hot) 50%, rgba(234,255,255,0.05) 82%, transparent);
+  will-change: transform;
+  filter: drop-shadow(0 0 8px rgba(34, 240, 255, 0.9));
+}
+.hud-edge--l, .hud-edge--r { top: 0; width: 2px; height: 34%; }
+.hud-edge--l { left: 0; }
+.hud-edge--r { right: 0; }
+.hud-edge--t, .hud-edge--b {
+  left: 0; height: 2px; width: 34%;
+  background: linear-gradient(90deg,
+    transparent, rgba(234,255,255,0.05) 18%, var(--hot) 50%, rgba(234,255,255,0.05) 82%, transparent);
+}
+.hud-edge--t { top: 0; }
+.hud-edge--b { bottom: 0; }
+
+@keyframes edge-v { from { transform: translate3d(0, -120%, 0); } to { transform: translate3d(0, 400%, 0); } }
+@keyframes edge-h { from { transform: translate3d(-120%, 0, 0); } to { transform: translate3d(400%, 0, 0); } }
+.hud-root.is-od .hud-edge--l { animation: edge-v 1.15s linear infinite; }
+.hud-root.is-od .hud-edge--r { animation: edge-v 1.15s linear infinite 0.42s; }
+.hud-root.is-od .hud-edge--t { animation: edge-h 1.35s linear infinite 0.2s; }
+.hud-root.is-od .hud-edge--b { animation: edge-h 1.35s linear infinite 0.72s; }
+
+/* ---- popups (pooled) ----------------------------------------------------- */
+.hud-pops {
+  position: absolute;
+  inset: 0;
+}
+
+/* Outer node carries POSITION only (set from JS as a translate3d).
+   Inner node carries the ANIMATION only. Separating them means the keyframes
+   never have to know where the popup is. */
+.pop {
+  position: absolute;
+  left: 0;
+  top: 0;
+  visibility: hidden;
+  will-change: transform;
+}
+.pop.is-live { visibility: visible; }
+
+.pop-i {
+  --rise: 60px;                        /* fallback; each kind overrides it */
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate3d(-50%, -50%, 0);
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-weight: 700;
+  opacity: 0;
+  will-change: transform, opacity;
+}
+
+/* Two names, alternated per spawn, so a recycled element restarts cleanly
+   without touching layout. --rise is the travel distance per kind. */
+@keyframes pop-a {
+  0%   { opacity: 0;    transform: translate3d(-50%, -50%, 0) scale(0.62); }
+  14%  { opacity: 1;    transform: translate3d(-50%, calc(-50% - (var(--rise) * 0.22)), 0) scale(1.16); }
+  32%  { opacity: 1;    transform: translate3d(-50%, calc(-50% - (var(--rise) * 0.42)), 0) scale(1); }
+  100% { opacity: 0;    transform: translate3d(-50%, calc(-50% - var(--rise)), 0) scale(0.92); }
+}
+@keyframes pop-b {
+  0%   { opacity: 0;    transform: translate3d(-50%, -50%, 0) scale(0.62); }
+  14%  { opacity: 1;    transform: translate3d(-50%, calc(-50% - (var(--rise) * 0.22)), 0) scale(1.16); }
+  32%  { opacity: 1;    transform: translate3d(-50%, calc(-50% - (var(--rise) * 0.42)), 0) scale(1); }
+  100% { opacity: 0;    transform: translate3d(-50%, calc(-50% - var(--rise)), 0) scale(0.92); }
+}
+.pop.run-a .pop-i { animation: pop-a 900ms cubic-bezier(.15,.75,.3,1) forwards; }
+.pop.run-b .pop-i { animation: pop-b 900ms cubic-bezier(.15,.75,.3,1) forwards; }
+
+/* Per-kind treatment. */
+.pop--perfect .pop-i {
+  --rise: 92px;
+  font-size: 27px;
+  letter-spacing: 0.16em;
+  color: var(--hot);
+  text-shadow:
+    0 0 4px #fff,
+    0 0 16px var(--cyan),
+    0 0 40px rgba(34, 240, 255, 0.75);
+}
+.pop--combo .pop-i {
+  --rise: 74px;
+  font-size: 21px;
+  letter-spacing: 0.12em;
+  color: var(--magenta);
+  text-shadow: 0 0 4px rgba(255,255,255,0.7), 0 0 18px var(--magenta);
+}
+.pop--orb .pop-i {
+  --rise: 66px;
+  font-size: 17px;
+  letter-spacing: 0.1em;
+  color: var(--amber);
+  text-shadow: 0 0 4px rgba(255,255,255,0.55), 0 0 16px var(--amber);
+}
+.pop--graze .pop-i {
+  --rise: 42px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: var(--cyan);
+  opacity: 0;
+  text-shadow: 0 0 8px rgba(34, 240, 255, 0.55);
+  filter: opacity(0.6);              /* tiny and dim, per spec */
+}
+
+/* =============================================================================
+   SCREENS
+   ========================================================================== */
+.scr {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding:
+    calc(var(--sat) + 18px)
+    calc(var(--sar) + 20px)
+    calc(var(--sab) + 18px)
+    calc(var(--sal) + 20px);
+  pointer-events: none;               /* containers stay transparent to touch */
+  opacity: 0;
+  visibility: hidden;
+  transform: translate3d(0, 14px, 0);
+  transition: opacity 300ms ease, transform 340ms cubic-bezier(.2,.9,.25,1),
+              visibility 0s linear 340ms;
+  will-change: transform, opacity;
+  /* Cheap vignette so text always reads over the bright game behind it. */
+  background:
+    radial-gradient(120% 76% at 50% 42%, rgba(4,3,12,0.86) 0%, rgba(4,3,12,0.6) 52%, rgba(4,3,12,0.9) 100%);
+  overflow: hidden;
+}
+.scr.is-in {
+  opacity: 1;
+  visibility: visible;
+  transform: translate3d(0, 0, 0);
+  transition: opacity 320ms ease, transform 420ms cubic-bezier(.2,.9,.25,1),
+              visibility 0s linear 0s;
+}
+
+/* Scanline wash — one repeating-gradient, no animation cost. */
+.scr::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(180deg,
+    rgba(34,240,255,0.035) 0px, rgba(34,240,255,0.035) 1px, transparent 1px, transparent 3px);
+  mix-blend-mode: screen;
+  opacity: 0.5;
+}
+
+.scr-body {
+  position: relative;
+  z-index: 1;
+  flex: 1 1 auto;
+  /* A flex item's default `min-height: auto` refuses to shrink below its
+     content, which would push the primary button off the bottom of a short
+     screen. Zeroing it guarantees the thumb-reachable CTA always survives. */
+  min-height: 0;
+  overflow: hidden;
+  width: 100%;
+  max-width: 460px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.scr-foot {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 460px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Staggered entrance for the children of a screen. */
+.scr .stagger {
+  opacity: 0;
+  transform: translate3d(0, 12px, 0);
+  transition: opacity 380ms ease, transform 440ms cubic-bezier(.2,.9,.25,1);
+}
+.scr.is-in .stagger { opacity: 1; transform: translate3d(0, 0, 0); }
+.scr.is-in .stagger:nth-child(1) { transition-delay: 60ms; }
+.scr.is-in .stagger:nth-child(2) { transition-delay: 130ms; }
+.scr.is-in .stagger:nth-child(3) { transition-delay: 200ms; }
+.scr.is-in .stagger:nth-child(4) { transition-delay: 270ms; }
+.scr.is-in .stagger:nth-child(5) { transition-delay: 340ms; }
+.scr.is-in .stagger:nth-child(6) { transition-delay: 410ms; }
+
+/* ---- brand --------------------------------------------------------------- */
+.brand {
+  position: relative;
+  display: block;
+  text-align: center;
+}
+.brand-title {
+  position: relative;
+  display: inline-block;
+  margin: 0;
+  font-family: var(--ui);
+  font-weight: 800;
+  font-size: clamp(34px, 12.6vw, 70px);
+  line-height: 1;
+  letter-spacing: 0.2em;
+  /* Letter-spacing appends a trailing gap after the last glyph. On a
+     shrink-to-fit inline-block that both widens the box and pushes the optical
+     centre left. A negative right margin cancels it exactly. */
+  margin-right: -0.2em;
+  color: var(--hot);
+  text-shadow:
+    0 0 3px rgba(255,255,255,0.95),
+    0 0 22px rgba(34, 240, 255, 0.7),
+    0 0 60px rgba(34, 240, 255, 0.35),
+    0 0 110px rgba(139, 92, 246, 0.3);
+}
+/* Chromatic split: two offset copies of the same text, screen-blended. */
+.brand-title::before,
+.brand-title::after {
+  content: attr(data-text);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  letter-spacing: inherit;
+  mix-blend-mode: screen;
+  text-shadow: none;
+  pointer-events: none;
+}
+.brand-title::before { color: var(--magenta); transform: translate3d(-2px, 0, 0); opacity: 0.55; }
+.brand-title::after  { color: var(--cyan);    transform: translate3d( 2px, 0, 0); opacity: 0.55; }
+
+@keyframes glitch-l {
+  0%, 92%, 100% { transform: translate3d(-2px, 0, 0); }
+  93%  { transform: translate3d(-7px, 1px, 0); }
+  95%  { transform: translate3d( 3px, -1px, 0); }
+  97%  { transform: translate3d(-4px, 0, 0); }
+}
+@keyframes glitch-r {
+  0%, 92%, 100% { transform: translate3d(2px, 0, 0); }
+  93%  { transform: translate3d( 8px, -1px, 0); }
+  95%  { transform: translate3d(-3px, 1px, 0); }
+  97%  { transform: translate3d( 5px, 0, 0); }
+}
+.brand-title::before { animation: glitch-l 6.5s steps(1, end) infinite; }
+.brand-title::after  { animation: glitch-r 6.5s steps(1, end) infinite; }
+
+.brand-tag {
+  margin: 10px 0 0;
+  font-family: var(--mono);
+  font-size: clamp(9px, 3vw, 11px);
+  font-weight: 600;
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;                /* block element: indent re-centres it */
+  color: var(--cyan);
+  opacity: 0.78;
+}
+
+/* ---- panels -------------------------------------------------------------- */
+.panel {
+  position: relative;
+  width: 100%;
+  padding: 14px 16px;
+  background: linear-gradient(180deg, rgba(10,10,31,0.66), rgba(4,3,12,0.66));
+  border: 1px solid var(--rule);
+  /* Notched corner, the standard cyberpunk-menu tell. */
+  clip-path: polygon(14px 0, 100% 0, 100% calc(100% - 14px), calc(100% - 14px) 100%, 0 100%, 0 14px);
+}
+.panel-hd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.32em;
+  color: var(--violet);
+}
+.panel-hd::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: linear-gradient(90deg, var(--rule), transparent);
+}
+
+/* ---- HOW panel ----------------------------------------------------------- */
+.how-row {
+  display: grid;
+  grid-template-columns: 1.6em 5.6em 1fr;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 0;
+  font-size: 12px;
+  line-height: 1.35;
+  border-top: 1px solid var(--rule-soft);
+}
+.how-row:first-of-type { border-top: 0; }
+.how-n {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--ink-dim);
+  letter-spacing: 0.1em;
+}
+.how-k {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--cyan);
+  text-shadow: 0 0 10px rgba(34,240,255,0.45);
+}
+.how-t { color: var(--ink); opacity: 0.86; }
+.how-t b { color: var(--hot); font-weight: 700; letter-spacing: 0.06em; }
+
+/* ---- swing diagram ------------------------------------------------------- */
+.diagram {
+  display: block;
+  width: 100%;
+  max-width: 260px;
+  height: auto;
+  margin: 2px auto 0;
+  overflow: visible;
+}
+.dg-anchor  { fill: var(--violet); }
+.dg-halo    { fill: var(--violet); opacity: 0.22; }
+.dg-arc     { fill: none; stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 4; }
+.dg-rope    { stroke: var(--cyan); stroke-width: 1.4; opacity: 0.85; }
+.dg-dot     { fill: var(--hot); }
+.dg-traj    { fill: none; stroke: var(--cyan); stroke-width: 1.6; stroke-linecap: round;
+              stroke-dasharray: 120; stroke-dashoffset: 120; opacity: 0; }
+.dg-flash   { fill: var(--hot); opacity: 0; }
+.dg-label   { fill: var(--ink-dim); font-family: var(--mono); font-size: 7px; letter-spacing: 0.16em; }
+
+/* The pendulum group rotates about the anchor; the release trajectory draws
+   itself in at the top of the swing. One 4s loop teaches the whole game. */
+.dg-swing {
+  transform-box: view-box;
+  transform-origin: 70px 16px;
+  animation: dg-swing 4s cubic-bezier(.45,0,.55,1) infinite;
+}
+@keyframes dg-swing {
+  0%   { transform: rotate(38deg); }
+  30%  { transform: rotate(-40deg); }
+  36%  { transform: rotate(-42deg); opacity: 1; }
+  46%  { transform: rotate(-42deg); opacity: 0; }
+  70%  { transform: rotate(-42deg); opacity: 0; }
+  86%  { transform: rotate(30deg); opacity: 1; }
+  100% { transform: rotate(38deg); opacity: 1; }
+}
+.dg-traj { animation: dg-traj 4s linear infinite; }
+@keyframes dg-traj {
+  0%, 34%   { stroke-dashoffset: 120; opacity: 0; }
+  38%       { stroke-dashoffset: 120; opacity: 1; }
+  62%       { stroke-dashoffset: 0;   opacity: 1; }
+  74%       { stroke-dashoffset: 0;   opacity: 0; }
+  100%      { stroke-dashoffset: 120; opacity: 0; }
+}
+.dg-flash {
+  transform-box: view-box;
+  transform-origin: 30px 40px;        /* the release point on the arc */
+  animation: dg-flash 4s linear infinite;
+}
+@keyframes dg-flash {
+  0%, 33%  { opacity: 0; transform: scale(0.4); }
+  37%      { opacity: 0.95; transform: scale(1); }
+  48%      { opacity: 0; transform: scale(1.9); }
+  100%     { opacity: 0; transform: scale(0.4); }
+}
+
+/* ---- stat readouts ------------------------------------------------------- */
+.stat {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border-top: 1px solid var(--rule-soft);
+}
+.stat:first-of-type { border-top: 0; }
+.stat-k {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.28em;
+  color: var(--ink-dim);
+}
+.stat-v {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+.stat--hero .stat-v {
+  font-size: 34px;
+  color: var(--hot);
+  text-shadow: 0 0 3px rgba(255,255,255,0.8), 0 0 20px rgba(34,240,255,0.55);
+}
+.stat--hero .stat-k { color: var(--cyan); opacity: 0.8; }
+.stat-u {
+  font-size: 0.5em;
+  letter-spacing: 0.2em;
+  color: var(--cyan);
+  opacity: 0.7;
+  margin-left: 0.3em;
+}
+
+.over-hd {
+  font-family: var(--mono);
+  font-size: clamp(13px, 4.4vw, 18px);
+  font-weight: 700;
+  letter-spacing: 0.42em;
+  text-indent: 0.42em;
+  color: var(--magenta);
+  text-shadow: 0 0 4px rgba(255,255,255,0.5), 0 0 24px var(--magenta);
+  text-align: center;
+}
+
+/* NEW BEST flourish */
+.newbest {
+  display: none;
+  position: relative;
+  padding: 6px 16px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  text-indent: 0.3em;
+  color: var(--void);
+  background: var(--amber);
+  clip-path: polygon(10px 0, 100% 0, calc(100% - 10px) 100%, 0 100%);
+  filter: drop-shadow(0 0 14px rgba(255, 176, 32, 0.85));
+}
+.newbest.is-on { display: inline-block; animation: nb-in 620ms cubic-bezier(.16,1.1,.3,1) both; }
+@keyframes nb-in {
+  0%   { opacity: 0; transform: scale3d(0.5, 0.5, 1) rotate(-4deg); }
+  55%  { opacity: 1; transform: scale3d(1.14, 1.14, 1) rotate(1.5deg); }
+  100% { opacity: 1; transform: scale3d(1, 1, 1) rotate(0deg); }
+}
+
+.best-line {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.24em;
+  color: var(--ink-dim);
+  text-align: center;
+}
+.best-line b {
+  color: var(--amber);
+  font-weight: 700;
+  text-shadow: 0 0 12px rgba(255, 176, 32, 0.55);
+}
+
+/* ---- buttons ------------------------------------------------------------- */
+.btn {
+  position: relative;
+  pointer-events: auto;               /* the ONLY interactive surfaces */
+  touch-action: manipulation;
+  -webkit-appearance: none;
+  appearance: none;
+  display: block;
+  width: 100%;
+  min-height: 60px;                   /* well above the 44px minimum target */
+  margin: 0;
+  padding: 18px 24px;
+  font-family: var(--mono);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  color: var(--void);
+  background: linear-gradient(180deg, var(--hot) 0%, var(--cyan) 100%);
+  border: 0;
+  border-radius: 0;
+  clip-path: polygon(16px 0, 100% 0, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%, 0 16px);
+  /* Filter (not box-shadow) so the neon halo survives the notched clip-path. */
+  filter: drop-shadow(0 0 16px rgba(34, 240, 255, 0.8));
+  cursor: pointer;
+  transition: transform 120ms ease, filter 160ms ease;
+  will-change: transform;
+}
+.btn:active {
+  transform: scale3d(0.97, 0.97, 1);
+  filter: drop-shadow(0 0 26px rgba(234, 255, 255, 1));
+}
+@keyframes btn-breathe {
+  0%, 100% { filter: drop-shadow(0 0 13px rgba(34, 240, 255, 0.72)); }
+  50%      { filter: drop-shadow(0 0 26px rgba(34, 240, 255, 1)); }
+}
+.btn--pulse { animation: btn-breathe 2.6s ease-in-out infinite; }
+
+.btn-hint {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.28em;
+  text-indent: 0.28em;
+  color: var(--ink-dim);
+  text-align: center;
+  opacity: 0.75;
+}
+
+/* Audio toggle, top-right corner, safe-area aware. Lives on #screens rather
+   than inside a screen so it survives the title → game-over swap, and fades
+   with `.is-on` so it is never floating over live gameplay. */
+.audio-btn {
+  position: absolute;
+  top: calc(var(--sat) + 12px);
+  right: calc(var(--sar) + 14px);
+  z-index: 3;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 240ms ease, transform 120ms ease,
+              visibility 0s linear 240ms;
+  pointer-events: auto;
+  touch-action: manipulation;
+  -webkit-appearance: none;
+  appearance: none;
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--cyan);
+  background: rgba(4, 3, 12, 0.55);
+  border: 1px solid var(--rule);
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  cursor: pointer;
+}
+.audio-btn.is-on {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 260ms ease 80ms, transform 120ms ease, visibility 0s linear 0s;
+}
+.audio-btn:active { transform: scale3d(0.92, 0.92, 1); }
+.audio-btn.is-off { color: var(--ink-dim); border-color: rgba(111, 139, 160, 0.22); }
+.audio-btn .ab-ico { font-size: 15px; line-height: 1; }
+
+/* Corner brackets — framing furniture for the whole screen. */
+.corner {
+  position: absolute;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--rule);
+  opacity: 0.8;
+}
+.corner--tl { top: calc(var(--sat) + 8px);  left: calc(var(--sal) + 10px);  border-right: 0; border-bottom: 0; }
+.corner--bl { bottom: calc(var(--sab) + 8px); left: calc(var(--sal) + 10px);  border-right: 0; border-top: 0; }
+.corner--br { bottom: calc(var(--sab) + 8px); right: calc(var(--sar) + 10px); border-left: 0;  border-top: 0; }
+
+/* =============================================================================
+   Short screens (iPhone SE / mini, and any landscape flip). Everything on the
+   title screen has to fit without scrolling — there is no scrolling.
+   ========================================================================== */
+@media (max-height: 745px) {
+  .scr-body { gap: 9px; }
+  .brand-title { font-size: clamp(30px, 11.2vw, 56px); }
+  .brand-tag { margin-top: 7px; font-size: 9px; letter-spacing: 0.28em; text-indent: 0.28em; }
+  .diagram { max-width: 190px; }
+  .panel { padding: 10px 13px; }
+  .panel-hd { margin-bottom: 7px; }
+  .how-row { padding: 4px 0; font-size: 11.5px; }
+  .stat { padding: 5px 0; }
+  .stat-v { font-size: 17px; }
+  .stat--hero .stat-v { font-size: 29px; }
+  .btn { min-height: 54px; padding: 15px 20px; font-size: 15px; }
+  .scr-foot { gap: 8px; }
+}
+@media (max-height: 640px) {
+  .diagram { display: none; }          /* first thing to go: pure decoration */
+  .brand-title { font-size: clamp(28px, 10vw, 48px); }
+}
+
+/* =============================================================================
+   Reduced motion — drop decoration, keep anything that carries meaning
+   (popup lifetime, screen visibility, charge fill, countdown ring).
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .brand-title::before,
+  .brand-title::after,
+  .dg-swing, .dg-traj, .dg-flash,
+  .btn--pulse,
+  .hud-root.is-od .hud-edge--l,
+  .hud-root.is-od .hud-edge--r,
+  .hud-root.is-od .hud-edge--t,
+  .hud-root.is-od .hud-edge--b {
+    animation: none !important;
+  }
+  .hud-root.is-full .hud-fullglow { animation: none !important; opacity: 0.6; }
+  .hud-mult.spring-a, .hud-mult.spring-b { animation: none !important; }
+  .scr, .scr .stagger { transition-duration: 140ms !important; transition-delay: 0ms !important; }
+  .scr { transform: none !important; }
+  .scr .stagger { transform: none !important; }
+  .pop.run-a .pop-i, .pop.run-b .pop-i { animation-duration: 700ms; }
+  .scr::after { display: none; }
+}
