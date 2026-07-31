@@ -146,6 +146,17 @@ const SETUPS = {
     g.render = function () { or(); const t = performance.now(); while (performance.now() - t < 12); };
   }, 26],
 
+  // Strategy 'p' on a pretend-120 panel with a pixel-invariant 12ms stall: the
+  // spending order must INVERT — quality walks to the floor first (uselessly, the
+  // stall does not scale, but the order is what is under test) and only then does
+  // the governor pace. Q-mode on the same load goes straight to cadence at q1.
+  cadence_p: [() => {
+    const g = window.game, or = g.render.bind(g);
+    g.setStrategy('p');
+    g._refreshIdx = 1; g.refreshMs = 1000 / 120;
+    g.render = function () { or(); const t = performance.now(); while (performance.now() - t < 12); };
+  }, 26],
+
   // iOS Low Power Mode: rAF delivers every OTHER vsync, and no amount of resolution
   // changes that. Expected arc: probe (one window at floor), believe the cap, restore
   // quality 1.0 at a steady 30. At t=18s the cap lifts; the belief must drop and the

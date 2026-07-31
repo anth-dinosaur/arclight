@@ -195,11 +195,35 @@ class Game {
     /** Presentation-capped (e.g. Low Power Mode) — see CFG.PERF_CAP_MISS. */
     this.capped = false;
     this._capProbe = false;     // floor-res probe in flight to confirm a suspected cap
+    /**
+     * Spending policy, toggled by tapping the perf readout.
+     *   'q' (default): highest resolution the display can smoothly show — rate is
+     *       spent first when overloaded, pixels are restored first when healthy.
+     *   'p': highest frame rate the panel offers — pixels are spent first, and the
+     *       governor periodically probes at floor resolution so an adaptive-sync
+     *       panel (ProMotion follows OUR frame time) gets a chance to reveal a
+     *       faster rate it would otherwise never show us.
+     */
+    this.strategy = 'q';
+    try { if (localStorage.getItem('arclight.strategy') === 'p') this.strategy = 'p'; } catch (_) {}
+    this._rateProbeQ = 0;       // quality to restore if the rate probe finds nothing
+    this._rateProbeIdx = 0;     // believed refresh when the probe launched
+    this._rateCleanT = 0;       // clean time since the last rate probe
+    this._rateBackoff = 1;      // grows after a probe that found no faster rate
     /** Diagnostics, for tools/dev. Rewritten each verdict, never reallocated. */
     this.perf = { refreshMs: 16.7, cadence: 1, missRatio: 0, quality: 1, fps: 60, capped: false };
     /** Corner perf readout — rendered fps over half-second buckets. */
     this._fpsEl = document.getElementById('perf');
     this._fpsN = 0; this._fpsT = 0; this._fpsStr = '';
+    if (this._fpsEl) {
+      // Tapping the readout flips the Q/P strategy. Stop the event here so the
+      // tap never doubles as a game input.
+      this._fpsEl.addEventListener('pointerdown', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        this.setStrategy(this.strategy === 'p' ? 'q' : 'p');
+      });
+    }
 
     // ---- state handed to subsystems (preallocated, never reallocated) ------
     this.postState = {
@@ -521,7 +545,8 @@ class Game {
     if (this._fpsT >= 500 && this._fpsEl) {
       const fps = Math.round(1000 * this._fpsN / this._fpsT);
       const s = fps + ' fps · q' + this.quality.toFixed(2)
-        + (this.capped ? ' · cap' : this.cadence > 1 ? ' · ½rate' : '');
+        + (this.capped ? ' · cap' : this.cadence > 1 ? ' · ½rate' : '')
+        + (this.strategy === 'p' ? ' · P' : ' · Q');
       if (s !== this._fpsStr) { this._fpsStr = s; this._fpsEl.textContent = s; }
       this._fpsN = 0; this._fpsT = 0;
     }
@@ -613,6 +638,7 @@ class Game {
       // cap and stop paying pixels for a deadline pixels cannot buy.
       if (this._capProbe || this.quality <= CFG.QUALITY_FLOOR) {
         this._capProbe = false;
+        this._rateProbeQ = 0;   // a rate probe in flight is moot under a cap
         this.capped = true;
         this.cadence = 1;       // pacing on top of a cap would halve the rate again
         this._acc = 0;
@@ -632,16 +658,40 @@ class Game {
       this._capProbe = false;
     }
 
+    // ---- rate probe (strategy 'p' only — see this.strategy) ----------------
+    // Resolved one full window after launch, whatever that window looked like.
+    // The refresh revision above has already had its chance to ratchet on the
+    // probe's cheap frames; whether it did IS the verdict.
+    if (this._rateProbeQ > 0) {
+      if (this._refreshIdx < this._rateProbeIdx) {
+        // Faster panel confirmed. STAY at floor and let the up path climb to what
+        // the new deadline sustains — restoring the old quality would judder.
+        this._rateBackoff = 1;
+      } else {
+        this.quality = this._rateProbeQ;
+        this.applyQuality();
+        this._rateBackoff = Math.min(16, this._rateBackoff * 2);
+      }
+      this._rateProbeQ = 0;
+      this._commit();
+      return;
+    }
+
     if (miss > CFG.PERF_DOWN_RATIO) {
       this._cleanT = 0;
-      // Pace down BEFORE turning anything down. Halving the rate costs no pixels,
-      // and on a high-refresh panel an exact divisor of the refresh is smoother
-      // than an in-between frame rate at higher resolution.
-      if (!this.capped && this.cadence === 1 && this.refreshMs * 2 <= CFG.PERF_CADENCE_MAX_MS) {
+      this._rateCleanT = 0;
+      // Which lever goes first is the whole difference between the strategies.
+      // 'q' paces down before touching pixels: halving the rate costs nothing, and
+      // an exact divisor of the refresh is smoother than an in-between frame rate
+      // at higher resolution. 'p' spends pixels first and only paces at the floor.
+      const canPace = !this.capped && this.cadence === 1
+        && this.refreshMs * 2 <= CFG.PERF_CADENCE_MAX_MS;
+      const canShrink = this.quality > CFG.QUALITY_FLOOR;
+      if (canPace && (this.strategy === 'q' || !canShrink)) {
         this.cadence = 2;
         this._acc = 0;
         this._commit();
-      } else if (this.quality > CFG.QUALITY_FLOOR) {
+      } else if (canShrink) {
         this.quality = Math.max(CFG.QUALITY_FLOOR, this.quality - 0.15);
         this.applyQuality();
         this._commit();
@@ -653,16 +703,20 @@ class Game {
 
     if (miss < CFG.PERF_UP_RATIO) {
       this._cleanT += this._winT / 1000;
+      this._rateCleanT += this._winT / 1000;
       if (this._cleanT >= CFG.PERF_UP_HOLD * this._probeBackoff) {
         this._cleanT = 0;
-        if (this.quality < 1) {
-          // Pixels back first: full resolution is worth more than the extra frames.
+        // Restoration order mirrors the spending order: 'q' takes pixels back first,
+        // 'p' takes the full rate back first.
+        const wantQuality = this.quality < 1;
+        const wantRate = this.cadence > 1;
+        if (this.strategy === 'q' ? wantQuality : (wantQuality && !wantRate)) {
           this.quality = Math.min(1, this.quality + 0.1);
           this.applyQuality();
           this._commit();
           return;
         }
-        if (this.cadence > 1) {
+        if (wantRate) {
           // Probe the full refresh again in case conditions changed. If it does not
           // hold we end up back here, so back the retry off to bound how often that
           // probe costs a window of stutter.
@@ -673,11 +727,47 @@ class Game {
           return;
         }
         this._probeBackoff = 1;   // fully healthy — forget past failures
+        // Fully healthy at the believed refresh. In 'p', ask whether the panel has
+        // a faster rate it is hiding: an adaptive-sync display follows OUR frame
+        // time, so it will never volunteer 120Hz while we render 12ms frames. One
+        // window of floor-res frames invites it to show its ceiling; the vote
+        // revision reads the answer. Backed off on failure — a 60Hz desktop would
+        // otherwise pay a soft window every few seconds forever.
+        if (this.strategy === 'p' && !this.capped && this._refreshIdx > 0
+            && this._rateCleanT >= CFG.PERF_UP_HOLD * this._rateBackoff) {
+          this._rateCleanT = 0;
+          this._rateProbeIdx = this._refreshIdx;
+          this._rateProbeQ = this.quality;
+          this.quality = CFG.QUALITY_FLOOR;
+          this.applyQuality();
+          this._commit();
+          return;
+        }
       }
     } else {
       this._cleanT = 0;
     }
     this._resetWindow();
+  }
+
+  /** Flip the spending policy (see this.strategy) and re-judge from a clean slate. */
+  setStrategy(s) {
+    if (s === this.strategy) return;
+    this.strategy = s;
+    try { localStorage.setItem('arclight.strategy', s); } catch (_) { /* private mode */ }
+    if (this._rateProbeQ > 0) {
+      this.quality = this._rateProbeQ;
+      this._rateProbeQ = 0;
+      this.applyQuality();
+    }
+    this._capProbe = false;
+    this._cleanT = 0; this._rateCleanT = 0;
+    this._probeBackoff = 1; this._rateBackoff = 1;
+    this._commit();
+    if (this._fpsEl) {
+      this._fpsStr = '';   // force the next bucket to rewrite
+      this._fpsEl.textContent = s === 'p' ? 'P · frame rate first' : 'Q · quality first';
+    }
   }
 
   /**
