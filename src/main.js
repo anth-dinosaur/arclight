@@ -214,7 +214,8 @@ class Game {
     this.events = makeEventSink(this);
 
     this.dpr = 1;
-    this.viewW = 1; this.viewH = 1;
+    this.viewW = 1; this.viewH = 1;       // native canvas px — quality-invariant
+    this.renderW = 1; this.renderH = 1;   // internal scene px — viewW×H × quality
     this.cssW = 1; this.cssH = 1;
     this._resizeRaf = 0;
     this.resize();
@@ -263,8 +264,14 @@ class Game {
     const rect = this.canvas.getBoundingClientRect();
     const cssW = Math.max(1, Math.round(rect.width) || window.innerWidth);
     const cssH = Math.max(1, Math.round(rect.height) || window.innerHeight);
-    const dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR)
-      * CFG.RENDER_SCALE * this.quality;
+    // The canvas backing store is NATIVE resolution, always — quality is not in
+    // this number. Internal resolution scales in the offscreen scene target and
+    // the composite upscales, so a governor step never reallocates the default
+    // framebuffer (Safari presents a stretched frame during that swap — it read
+    // as a momentary zoom), never softens the grain/scanline/dither grade, and
+    // never moves baseZoom, which `zoomBoost` chases over ~300ms: deriving it
+    // from a quality-scaled width made every quality change a visible zoom.
+    const dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR) * CFG.RENDER_SCALE;
     this.cssW = cssW; this.cssH = cssH;
     this.dpr = dpr;
     const w = Math.round(cssW * dpr), h = Math.round(cssH * dpr);
@@ -275,7 +282,7 @@ class Game {
     // Deliberately NOT writing canvas.style.{width,height}: pinning the box in
     // px overrides the 100dvh rule and freezes it mid-transition.
     this.viewW = w; this.viewH = h;
-    this.post.resize(w, h);
+    this.applyQuality();
     // Portrait phones get the design width; wide screens keep the same vertical extent
     // so a desktop browser sees more sky rather than a giant player.
     const aspect = w / h;
@@ -669,13 +676,19 @@ class Game {
     this._resetWindow();
   }
 
-  /** Push the current quality into the scene target and the bloom chain. */
+  /**
+   * Push the current quality into the scene target and the bloom chain. The canvas
+   * is untouched: only offscreen targets reallocate, so a quality step costs a
+   * texture realloc (covered by the governor cooldown) and no visible artifact.
+   */
   applyQuality() {
     // Shrink the bloom chain with the scene. Post exposes the hook and nothing was
     // calling it, so the blur ping-pongs — the most fill-rate-hungry part of the
     // frame — stayed full size no matter how far quality dropped.
     this.post.setQuality(this.quality);
-    this.resize();
+    this.renderW = Math.max(1, Math.round(this.viewW * this.quality));
+    this.renderH = Math.max(1, Math.round(this.viewH * this.quality));
+    this.post.resize(this.renderW, this.renderH);
   }
 
   /** Commit a pacing/quality change: swallow the settling hitch, then re-measure. */
@@ -911,18 +924,25 @@ class Game {
     const camY = this.camY + this.shakeY;
 
     const r = this.renderer;
-    r.begin(camX, camY, this.zoom, this.roll, this.viewW, this.viewH);
+    // The scene pass runs at internal resolution: same world framing, fewer pixels.
+    // zoom stays in NATIVE px per world unit everywhere else (worldToScreen, culling)
+    // and is scaled down only here, so a quality change never moves the camera.
+    const rs = this.renderW / this.viewW;
+    const zoomEff = this.zoom * rs;   // internal px per world unit, for the scene pass
+    r.begin(camX, camY, zoomEff, this.roll, this.renderW, this.renderH);
 
     const viewWorldW = this.viewW / this.zoom;
     const viewWorldH = this.viewH / this.zoom;
 
-    this.backdrop.render(r, camX, camY, viewWorldW, viewWorldH, this.zoom);
+    // Subsystems get zoomEff: they use zoom to size anti-aliasing feather in "one
+    // screen pixel" terms, and their screen is the internal target.
+    this.backdrop.render(r, camX, camY, viewWorldW, viewWorldH, zoomEff);
     // flood01 is passed in rather than recomputed: the water alarm and the danger
     // vignette are one telegraph in two channels and must share one input.
-    this.world.render(r, camX, viewWorldW, this.zoom, this.time,
+    this.world.render(r, camX, viewWorldW, zoomEff, this.time,
       this.state === STATE.PLAY ? this.flood01 : 0);
     if (this.state !== STATE.DEAD || this.player.alive) this.player.render(r, this.time);
-    this.fx.render(r, this.zoom);
+    this.fx.render(r, zoomEff);
 
     // Scene -> HDR target
     const scene = this.post.sceneTarget;

@@ -60,7 +60,7 @@ async function run(name, setup, seconds) {
     window.__iv = setInterval(() => window.__t.trace.push({
       t: +(g.time).toFixed(1), q: +g.quality.toFixed(2), cad: g.cadence,
       refresh: g.perf.refreshMs, miss: g.perf.missRatio, fps: g.perf.fps,
-      cap: g.capped ? 1 : 0, px: g.viewW * g.viewH,
+      cap: g.capped ? 1 : 0, px: g.renderW * g.renderH,
     }), 500);
   });
 
@@ -111,8 +111,8 @@ const SETUPS = {
   // fill-rate load. 26ms at full res, so floor res (¼ the pixels) comfortably fits.
   heavy: [() => {
     const g = window.game, or = g.render.bind(g);
-    const base = g.viewW * g.viewH;
-    g.render = function () { or(); const ms = 26 * (g.viewW * g.viewH) / base; const t = performance.now(); while (performance.now() - t < ms); };
+    const base = g.renderW * g.renderH;
+    g.render = function () { or(); const ms = 26 * (g.renderW * g.renderH) / base; const t = performance.now(); while (performance.now() - t < ms); };
   }, 26],
 
   // Healthy, with a 40ms stall roughly every 2.5s — the isolated-hiccup case. The
@@ -129,11 +129,11 @@ const SETUPS = {
   // Overload for the first 12s, then it stops. Must claw back.
   recovery: [() => {
     const g = window.game, or = g.render.bind(g);
-    const base = g.viewW * g.viewH;
+    const base = g.renderW * g.renderH;
     const t0 = performance.now();
     g.render = function () {
       or();
-      if (performance.now() - t0 < 12000) { const ms = 26 * (g.viewW * g.viewH) / base; const t = performance.now(); while (performance.now() - t < ms); }
+      if (performance.now() - t0 < 12000) { const ms = 26 * (g.renderW * g.renderH) / base; const t = performance.now(); while (performance.now() - t < ms); }
     };
   }, 40],
 
