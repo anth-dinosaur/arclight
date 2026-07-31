@@ -136,6 +136,29 @@ must read zero.
 > before — but the honest form of the invariant is "no unavoidable death has been found
 > at the widest scan we run", and the scan width is part of the claim.
 
+**Avoidable and fair are not the same claim.** The audit's 2.2s lookback measures
+PLAN-fairness: some line existed. Run with `--lookback 0.6` it measures REACTION-fairness
+— the player standing at the telegraph still has an out — and that number is nowhere
+near zero: at 90 seeds roughly a third of all deaths are not reactable inside 0.6s, and
+lasers are the largest single cause (11/29 smart, 15/41 metronome, 17/34 hold). Those
+deaths pass the long audit because the escape was upstream, at a release made while the
+beam was dark and silent. That is the "it snapped on in my path mid-flight" experience:
+formally avoidable, felt as unfair. Two changes target it without touching the duty
+cycles:
+
+- **Snap-on grace.** Only flying INTO a live beam kills. A beam that fires around a
+  player already inside its box holds fire for them until they exit — which also makes
+  threading the charge-up tell a deliberate expert line instead of a coin flip on the
+  phase hash. Measured at 60 seeds: `smart` is byte-identical (it never coasts inside a
+  dark beam — the grace costs the top tier literally nothing), `hold` gains +25m median,
+  and the score gradient pays 10.2x → 9.6x. That 0.6x is a real cost, paid knowingly:
+  unlike the catch-row trade (distance for gradient) this buys the felt form of the
+  page's own "single most valuable property". The 2.2s invariant stays zero with the
+  grace in place.
+- **The emitter clock** (see the telegraph note in the difficulty section) — the larger
+  share of the reactive gap is flying into an *already-live* beam seen too late, which
+  is a legibility problem the sims cannot score because bots do not look at the screen.
+
 ## Difficulty curve
 Distance-driven, continuous, no discrete levels. **All distances below are world units;
 the metre counter on the HUD reads world units / 2.**
@@ -216,6 +239,19 @@ Three things make this a curve rather than a step:
   median run ends. The real within-run gain is about a seventh, not a third.)
 - **Threats arrive in order of readability.** Hazards blink and telegraph, so they come
   first; architecture is a silhouette with no tell, so it stays a bounce until later.
+
+**The laser's clock is readable at a glance, not only over a cycle.** "The blink is a
+clock" was true but expensive to read: a dark beam was informationally silent until the
+final 0.4s tell, and a player crossing at 50 m/s gets less than one full cycle between
+the beam entering view and the release that commits their line — so the phase they were
+betting on was effectively a coin flip. The emitters (and, faintly, the tracer line,
+because a lane-crossing beam can have both emitters off-frame) now beat through the
+entire dark phase on a rate that accelerates from 1.1Hz to 5Hz across the last
+`WORLD_LASER_WARN` (2.5) seconds before firing — the same accelerating-rhythm grammar as
+the floodline alarm, for the same reason: rhythm survives peripheral vision, and an
+accelerating rhythm says "closing" without a number. The beat's phase is the analytic
+integral of the rate curve, so it speeds up smoothly rather than jumping. Duty cycles,
+periods and the 0.4s tell are all unchanged — this adds information, not ease.
 
 **The water gets a tell, on the same clock as a laser.** Drowning was the only lethal
 thing in the game with no telegraph, and it was the biggest single killer of the tier

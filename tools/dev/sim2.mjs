@@ -329,7 +329,9 @@ function simulate(seed, botMode, cap = CAP, override = null) {
         for (let k = 0; k < hz.length && !hit; k++) {
           const h = hz[k];
           if (h && h.alive !== false &&
-              circleVsOBB(out.crashX, out.crashY, CFG.PLAYER_RADIUS + 0.4, h.x, h.y, h.hw, h.hh, h.rot || 0)) hit = 'HAZARD';
+              circleVsOBB(out.crashX, out.crashY, CFG.PLAYER_RADIUS + 0.4, h.x, h.y, h.hw, h.hh, h.rot || 0)) {
+            hit = ['LASER', 'DRONE', 'SPINNER', 'GATE'][h.kind] || 'HAZARD';
+          }
         }
         if (!hit) {
           const so = world.solids;
@@ -387,7 +389,13 @@ function simulate(seed, botMode, cap = CAP, override = null) {
 // Measured — hold/seed 3 died at 46.95s and the latest input that saves it is at
 // 45.00s, 1.95s earlier. A 1.8s lookback reported that death as UNAVOIDABLE, which is
 // the most expensive kind of false alarm this tool can raise.
-const LOOKBACK = 2.2;
+//
+// Overridable (--lookback 0.6) because the SHORT form asks a different question. At
+// 2.2s the audit measures PLAN-fairness: some line existed. At ~0.6s it measures
+// REACTION-fairness: the player standing at the telegraph still has an out. A death
+// that passes the long audit and fails the short one is the "it snapped on in my
+// path mid-flight" experience — formally avoidable, felt as unfair.
+const LOOKBACK = flag('lookback', 2.2);
 const SURVIVE_FOR = 1.2;
 const PROBE_STEP = 0.1;
 /** Dwell lengths for the intervention. `undefined` means "hold the new input forever";
@@ -436,7 +444,9 @@ for (const bot of ['smart', 'metronome', 'hold']) {
   const reach = rs.reduce((a, r) => a + r.reachFailures, 0);
 
   summary[bot] = { score: A('score'), dist: M('dist') };
-  terse.push(`${bot[0]}: ${M('dist')}m/${M('t')}s haz${(causes.HAZARD || 0)} sol${(causes.SOLID || 0)} fld${(causes.FLOODLINE || 0)} srv${(causes.SURVIVED || 0)} od${f1(A('odTriggers'))} gz${f1(gT)} df${f1(A('deflects'))}`);
+  const hazDeaths = (causes.LASER || 0) + (causes.DRONE || 0) + (causes.SPINNER || 0)
+    + (causes.GATE || 0) + (causes.HAZARD || 0);
+  terse.push(`${bot[0]}: ${M('dist')}m/${M('t')}s haz${hazDeaths} sol${(causes.SOLID || 0)} fld${(causes.FLOODLINE || 0)} srv${(causes.SURVIVED || 0)} od${f1(A('odTriggers'))} gz${f1(gT)} df${f1(A('deflects'))}`);
   if (TERSE) continue;
 
   console.log(`\n=== ${bot.toUpperCase()} (${SEEDS} seeds, ${CAP}s cap) ===`);

@@ -227,6 +227,18 @@ const LASER_PERIOD_EARLY = CFG.WORLD_LASER_PERIOD_EARLY ?? 3.3;
 const LASER_ON     = CFG.WORLD_LASER_ON ?? 0.46;  // fraction of the cycle the beam is lethal
 const LASER_ON_EARLY = CFG.WORLD_LASER_ON_EARLY ?? 0.26;
 const LASER_TELL   = CFG.WORLD_LASER_TELL ?? 0.4; // seconds of charge-up telegraph
+// The emitter clock. A dark beam used to be informationally SILENT until the final
+// 0.4s tell: the blink is a clock, but a clock you can only read by watching a full
+// cycle — and a player crossing at 50 m/s gets less than one cycle between the beam
+// entering view and the release that commits their line, so the phase was a coin
+// flip read at a glance. The emitters now beat through the whole dark phase, on a
+// rate that accelerates from LASER_WARN_HZ0 to LASER_WARN_HZ1 across the final
+// LASER_WARN seconds before firing. Same grammar as the floodline alarm: an
+// accelerating rhythm says "closing" without a number, and rhythm survives
+// peripheral vision on a noisy frame where a brightness ramp does not.
+const LASER_WARN     = CFG.WORLD_LASER_WARN ?? 2.5;   // s of accelerating beat
+const LASER_WARN_HZ0 = 1.1;   // beat rate far from firing (matches the flood alarm)
+const LASER_WARN_HZ1 = 5.0;   // beat rate at the moment the tell takes over
 // The authored first hazard — see CFG. `FIRST_HAZ_CHUNK` is the first chunk that is not
 // tutorial, so this beat always lands the moment the grace period ends, on every seed.
 const FIRST_LASER_PERIOD = CFG.WORLD_FIRST_LASER_PERIOD ?? 3.6;
@@ -493,8 +505,8 @@ export class World {
     // `per`/`duty`/`dphase` are the drone's lethality cycle — see _animate case 1.
     this._pHazard = new Pool(MAX_HAZARDS, () => ({
       x: 0, y: 0, hw: 1, hh: 1, rot: 0, kind: 0, alive: false, phase: 0, vx: 0, vy: 0,
-      chunk: 0, hx: 0, hy: 0, amp: 0, rate: 0, sgn: 1, tell: 0,
-      per: 0, duty: 0, dphase: 0, _grazeCd: 0,
+      chunk: 0, hx: 0, hy: 0, amp: 0, rate: 0, sgn: 1, tell: 0, tt: 0,
+      per: 0, duty: 0, dphase: 0, _grazeCd: 0, _inside: false,
     }));
     this._pOrb = new Pool(MAX_ORBS, () => ({
       x: 0, y: 0, r: ORB_R, alive: false, phase: 0, collected: false,
@@ -683,6 +695,7 @@ export class World {
           let c = (t / h.rate + h.phase) % 1;
           if (c < 0) c += 1;
           h.alive = c < h.amp;
+          h.tt = (1 - c) * h.rate;   // seconds until the beam next fires — the clock
           const tellFrac = LASER_TELL / h.rate;
           h.tell = c >= 1 - tellFrac ? (c - (1 - tellFrac)) / tellFrac : 0;
           break;
@@ -1467,8 +1480,8 @@ export class World {
     h.kind = kind; h.alive = true;
     h.phase = hash2(Math.round(x * 4) ^ kind, Math.round(y * 4) ^ ci);
     h.vx = 0; h.vy = 0;
-    h.amp = 0; h.rate = 1; h.sgn = 1; h.tell = 0;
-    h.per = 0; h.duty = 0; h.dphase = 0; h._grazeCd = 0;
+    h.amp = 0; h.rate = 1; h.sgn = 1; h.tell = 0; h.tt = 0;
+    h.per = 0; h.duty = 0; h.dphase = 0; h._grazeCd = 0; h._inside = false;
     if (kind === 0) {
       // `rate` carries the cycle period and `amp` the lethal fraction, both eased so a
       // player's first encounters have a long, obvious, survivable gap.
@@ -2033,8 +2046,11 @@ export class World {
   }
 
   /** Laser: emitter caps at both ends are always visible so you can read the threat
-   *  line before it fires; a charge-up bloom telegraphs the shot ~0.4s early. That
-   *  telegraph is the entire fairness contract of this hazard. */
+   *  line before it fires. The fairness contract is three layers deep: the emitters
+   *  BEAT through the whole dark phase at a rate that accelerates toward firing (the
+   *  clock, readable at a glance from across the frame), the charge-up bloom marks
+   *  the final ~0.4s (the tell), and a beam that fires around a player already
+   *  inside its box does not kill (the snap-on grace, in player._collide). */
   _drawLaser(r, h, aa, time) {
     let pc = 0;
     const c = Math.cos(h.rot), s = Math.sin(h.rot);
@@ -2048,7 +2064,26 @@ export class World {
     r.rect(LAYER.SOLID, bx, by, 0.85, 0.85, h.rot, SC0, { soft: aa, radius: 0.3 });
     pc += 2;
 
-    const capBr = h.alive ? 0.95 : 0.22 + 0.7 * tell * tell;
+    // Emitter brightness. Live: pinned bright. Dark: the accelerating beat — phase
+    // is the analytic integral of the rate curve (constant HZ0 out past LASER_WARN,
+    // ramping to HZ1 at the moment of firing), so the beat speeds up smoothly with
+    // no phase jump, and its ETA is readable without watching a full cycle. Squared
+    // into a beat rather than a breath, amplitude growing as firing approaches, and
+    // the existing tell² ramp takes over for the final 0.4s.
+    let capBr, beat = 0;
+    if (h.alive) {
+      capBr = 0.95;
+    } else {
+      const tt = h.tt, W = LASER_WARN;
+      const ramp = LASER_WARN_HZ1 - LASER_WARN_HZ0;                 // Hz gained over W
+      const R = tt >= W
+        ? (LASER_WARN_HZ1 + LASER_WARN_HZ0) * 0.5 * W + LASER_WARN_HZ0 * (tt - W)
+        : LASER_WARN_HZ1 * tt - (ramp / (2 * W)) * tt * tt;         // cycles to firing
+      const u = 1 - Math.min(1, tt / W);                            // urgency 0 → 1
+      const b = 0.5 + 0.5 * Math.sin((h.phase - R) * TAU);
+      beat = b * b * u;
+      capBr = 0.16 + (0.10 + 0.28 * u) * b * b + 0.66 * tell * tell;
+    }
     tint(SC1, PAL.magentaHot, capBr, 1);
     r.circle(LAYER.NEON, ax, ay, 0.36, SC1, { glow: 1.1, glowRadius: 0.7, soft: aa });
     r.circle(LAYER.NEON, bx, by, 0.36, SC1, { glow: 1.1, glowRadius: 0.7, soft: aa });
@@ -2077,9 +2112,14 @@ export class World {
       r.glow(LAYER.FAR_GLOW, h.x, h.y, h.hw * 0.55, SC3);
       pc++;
     } else {
-      // Dormant: a barely-there tracer so the lane is still readable.
-      tint(SC2, PAL.magenta, 0.10, 1);
-      r.line(LAYER.NEON, ax, ay, bx, by, 0.05, SC2, { glow: 0.3, glowRadius: 0.3, soft: aa });
+      // Dormant: a barely-there tracer so the lane is still readable. It ticks with
+      // the emitter beat as firing approaches, because a beam crossing the whole
+      // lane can have both emitters outside the frame — the line is then the only
+      // place the clock can be read. Peaks well under the live beam's 0.42/2.0-width
+      // so a warming beam never reads as a lit one.
+      tint(SC2, PAL.magenta, 0.10 + 0.11 * beat, 1);
+      r.line(LAYER.NEON, ax, ay, bx, by, 0.05 + 0.05 * beat, SC2,
+        { glow: 0.3 + 0.3 * beat, glowRadius: 0.3, soft: aa });
       pc++;
     }
     return pc;

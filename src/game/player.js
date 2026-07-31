@@ -998,7 +998,11 @@ export class Player {
     if (hazards) {
       for (let i = 0; i < hazards.length && this._hazN < CAND_MAX; i++) {
         const o = hazards[i];
-        if (!o || o.alive === false) continue;
+        if (!o) continue;
+        // Dark lasers stay in the list: the snap-on grace in _collide can only know
+        // a flash caught the player ALREADY INSIDE by watching the overlap while the
+        // beam is still dark. Every consumer of _hazIdx re-checks `alive` itself.
+        if (o.alive === false && o.kind !== 0) continue;
         const ex = o.hw > o.hh ? o.hw : o.hh;
         const dx = o.x - x;
         if (dx > win + ex || dx < -win - ex) continue;
@@ -1054,7 +1058,25 @@ export class Player {
     if (hazards && !this.invuln) {
       for (let k = 0; k < this._hazN; k++) {
         const o = hazards[this._hazIdx[k]];
-        if (!o || o.alive === false) continue;
+        if (!o) continue;
+        if (o.kind === 0) {
+          // SNAP-ON GRACE. Only flying INTO a live beam kills; a beam that fires
+          // around a player already inside its box does not. `_inside` means "has
+          // been continuously inside since before the beam last went live": set
+          // while overlapping the dark beam, held while it is live, cleared on
+          // exit. The felt-unfair laser death is precisely the one where the
+          // avoidability audit says "you had 2.2s" but the player standing at the
+          // tell has already spent every input — this deletes that case, and turns
+          // threading the charge-up tell into a deliberate expert line instead of
+          // a coin flip on the phase hash.
+          const inside = circleVsOBB(x, y, RADIUS, o.x, o.y, o.hw, o.hh, o.rot || 0);
+          if (o.alive === false) { o._inside = inside; continue; }
+          if (!inside) { o._inside = false; continue; }
+          if (o._inside) continue;
+          this._crash(events);
+          return;
+        }
+        if (o.alive === false) continue;
         if (circleVsOBB(x, y, RADIUS, o.x, o.y, o.hw, o.hh, o.rot || 0)) {
           this._crash(events);
           return;
