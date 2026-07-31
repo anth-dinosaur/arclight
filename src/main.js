@@ -193,6 +193,9 @@ class Game {
     this._capProbe = false;     // floor-res probe in flight to confirm a suspected cap
     /** Diagnostics, for tools/dev. Rewritten each verdict, never reallocated. */
     this.perf = { refreshMs: 16.7, cadence: 1, missRatio: 0, quality: 1, fps: 60, capped: false };
+    /** Corner perf readout — rendered fps over half-second buckets. */
+    this._fpsEl = document.getElementById('perf');
+    this._fpsN = 0; this._fpsT = 0; this._fpsStr = '';
 
     // ---- state handed to subsystems (preallocated, never reallocated) ------
     this.postState = {
@@ -500,6 +503,17 @@ class Game {
     this.input.poll();
     this.update(rawDt);
     this.render();
+
+    // Corner readout: rendered fps + what the governor is doing about it. Text is
+    // rebuilt twice a second and only touches the DOM when it actually changed.
+    this._fpsN++; this._fpsT += frameMs;
+    if (this._fpsT >= 500 && this._fpsEl) {
+      const fps = Math.round(1000 * this._fpsN / this._fpsT);
+      const s = fps + ' fps · q' + this.quality.toFixed(2)
+        + (this.capped ? ' · cap' : this.cadence > 1 ? ' · ½rate' : '');
+      if (s !== this._fpsStr) { this._fpsStr = s; this._fpsEl.textContent = s; }
+      this._fpsN = 0; this._fpsT = 0;
+    }
   }
 
   /**

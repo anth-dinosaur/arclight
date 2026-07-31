@@ -7,7 +7,10 @@
 export const CFG = {
   // ---- view ---------------------------------------------------------------
   VIEW_WIDTH: 46,          // world units visible horizontally; drives zoom
-  MAX_DPR: 2.0,
+  // Native panel resolution on 3× iPhones. ~2.25× the fill cost of the old 2.0 cap;
+  // affordable on recent GPUs, and where it is not, the governor measures that and
+  // walks internal resolution down rather than letting the frame rate judder.
+  MAX_DPR: 3.0,
   CAMERA_FOLLOW: 7.0,      // damping rate, higher = stiffer
   // Seconds of velocity to lead by, and the hard cap on that lead.
   // Load-bearing for whether SKILL PAYS. Difficulty is distance-driven, so flying

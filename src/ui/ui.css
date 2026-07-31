@@ -118,6 +118,21 @@ body {
 #hud     { z-index: 10; }
 #screens { z-index: 20; }
 
+/* Perf readout (bottom left) — deliberately barely-there. Above #screens so the
+   governor can be watched settling on-device before a run starts. */
+#perf {
+  position: fixed;
+  left: calc(var(--sal) + 8px);
+  bottom: calc(var(--sab) + 6px);
+  z-index: 30;
+  font: 10px/1 ui-monospace, Menlo, monospace;
+  letter-spacing: 0.06em;
+  color: rgba(255, 255, 255, 0.35);
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 .noscript {
   position: fixed;
   inset: 0;
