@@ -30,7 +30,11 @@ const STATE = { TITLE: 0, PLAY: 1, DYING: 2, DEAD: 3 };
 // through the intervention probe described at CFG.PERF_CAP_MISS, never by votes.
 // (The slot still collects votes: that is how the doubled beat is recognised going
 // in, and how its disappearance is recognised coming out.)
-const REFRESH_MS = [1000 / 144, 1000 / 120, 1000 / 90, 1000 / 60, 1000 / 30];
+// 80Hz is not a typo for 90: ProMotion steps are divisors of 240 (120, 80, 60, 48…)
+// and the panel adaptively drops to 80 when frames take ~12.5ms — a state a 120Hz
+// iPhone actually sits in for long stretches. Both stay listed; the vote quantiser
+// discriminates 11.1 from 12.5 comfortably, and Android panels really do run 90.
+const REFRESH_MS = [1000 / 144, 1000 / 120, 1000 / 90, 1000 / 80, 1000 / 60, 1000 / 30];
 /** Slowest refresh VOTES may believe (60Hz) — see above; the ratchet stops here. */
 const REFRESH_SLOWEST = REFRESH_MS.length - 2;
 /** The presentation-cap slot (30Hz), reachable only by the cap probe. */
