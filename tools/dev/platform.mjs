@@ -737,10 +737,12 @@ async function t9() {
     window.__q = [];
     const or = g.render.bind(g);
     g.render = function () { or(); const t = performance.now(); while (performance.now() - t < 26); };  // force ~26ms frames
-    const iv = setInterval(() => window.__q.push({ q: g.quality, postQ: g.post.quality, w: g.post.w, mip0: g.post.mipW[0], frameMs: +g.frameMs.toFixed(1), slow: g.slowFrames }), 250);
-    setTimeout(() => clearInterval(iv), 9000);
+    const iv = setInterval(() => window.__q.push({ q: g.quality, postQ: g.post.quality, w: g.post.w, mip0: g.post.mipW[0], frameMs: +g.frameMs.toFixed(1), cadence: g.cadence, miss: g.perf.missRatio, refresh: g.perf.refreshMs }), 250);
+    setTimeout(() => clearInterval(iv), 14000);
   });
-  await page.waitForTimeout(9500);
+  // The governor now judges over multi-second windows by design, so a degradation
+  // test has to run longer than one window to observe anything at all.
+  await page.waitForTimeout(14500);
   const qTrace = await page.evaluate(() => window.__q);
 
   rec('EXTRA — hunting', 'INFO', {

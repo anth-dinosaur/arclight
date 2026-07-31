@@ -16,6 +16,31 @@ import { Screens } from './ui/screens.js';
 
 const STATE = { TITLE: 0, PLAY: 1, DYING: 2, DEAD: 3 };
 
+// Standard display intervals, ms, fastest first. Quantising measured intervals to
+// this list strips vsync jitter and keeps the deadline a number a panel can hit.
+//
+// The list stops at 60Hz, and that is load-bearing rather than lazy. From rAF
+// deltas alone "a 30Hz display" and "a 60Hz display where we miss every other
+// vsync" are the SAME OBSERVATION — steady 33ms callbacks — and no browser API
+// exposes the real refresh rate to disambiguate them. Since a display slower than
+// 60Hz essentially does not exist, while a 60Hz display we are only half keeping up
+// with is the single most common way this game runs badly, the tie is broken toward
+// the latter every time. The cost of being wrong is a reduced internal resolution
+// during a battery-saver rAF cap, which is roughly what you want there anyway.
+const REFRESH_MS = [1000 / 144, 1000 / 120, 1000 / 90, 1000 / 60];
+/** Slowest refresh the governor will ever believe in — see above. */
+const REFRESH_SLOWEST = REFRESH_MS.length - 1;
+
+/** Index of the standard display interval nearest a measured one. */
+function nearestRefresh(ms) {
+  let best = 0, bestD = Infinity;
+  for (let i = 0; i < REFRESH_MS.length; i++) {
+    const d = Math.abs(ms - REFRESH_MS[i]);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
+
 // ---------------------------------------------------------------------------------
 // COMBO LADDER
 //
@@ -138,10 +163,28 @@ class Game {
 
     // ---- adaptive quality --------------------------------------------------
     this.quality = 1;
-    this.slowFrames = 0;
-    this.fastFrames = 0;
-    this.frameMs = 16.7;
+    this.frameMs = 16.7;        // smoothed, diagnostic only — see adaptQuality
     this.frameCount = 0;
+    /** Presentation cadence: render every Nth vsync. See CFG frame-pacing block. */
+    this.cadence = 1;
+    this._acc = 0;              // accumulated unrendered vsync time
+    // Believed display interval. Starts pessimistic (60Hz) and only ever ratchets
+    // FASTER, tracked as a high-water mark: a panel does not slow down mid-session,
+    // so once we have seen 120Hz vsyncs, later windows that never manage one are
+    // evidence we are dropping frames — not evidence the display changed.
+    this._refreshIdx = REFRESH_SLOWEST;
+    this.refreshMs = REFRESH_MS[REFRESH_SLOWEST];
+    this._winT = 0;             // elapsed time in the current verdict window
+    this._winN = 0;             // rendered frames in it
+    this._winMiss = 0;          // ...of which missed the deadline
+    /** Votes per standard refresh rate — how the display's cadence is identified. */
+    this._rBins = new Int32Array(REFRESH_MS.length);
+    this._rVotes = 0;
+    this._cleanT = 0;           // consecutive clean time, for stepping back up
+    this._cooldown = 0;
+    this._probeBackoff = 1;     // grows after a failed cadence-1 probe
+    /** Diagnostics, for tools/dev. Rewritten each verdict, never reallocated. */
+    this.perf = { refreshMs: 16.7, cadence: 1, missRatio: 0, quality: 1, fps: 60 };
 
     // ---- state handed to subsystems (preallocated, never reallocated) ------
     this.postState = {
@@ -183,7 +226,13 @@ class Game {
 
     document.addEventListener('visibilitychange', () => {
       // Coming back from a background tab produces one gigantic dt; swallow it.
-      if (!document.hidden) this.lastT = performance.now();
+      // The pacing accumulator and the verdict window have to go with it, or that
+      // one frame reads as a missed deadline and can cost a quality step.
+      if (!document.hidden) {
+        this.lastT = this._prevNow = performance.now();
+        this._acc = 0;
+        this._resetWindow();
+      }
     });
 
     this.screens.showTitle();
@@ -203,7 +252,8 @@ class Game {
     const rect = this.canvas.getBoundingClientRect();
     const cssW = Math.max(1, Math.round(rect.width) || window.innerWidth);
     const cssH = Math.max(1, Math.round(rect.height) || window.innerHeight);
-    const dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR) * this.quality;
+    const dpr = Math.min(window.devicePixelRatio || 1, CFG.MAX_DPR)
+      * CFG.RENDER_SCALE * this.quality;
     this.cssW = cssW; this.cssH = cssH;
     this.dpr = dpr;
     const w = Math.round(cssW * dpr), h = Math.round(cssH * dpr);
@@ -236,7 +286,12 @@ class Game {
     this.post = new Post(this.gl, this.quad);
     this.post.setQuality(this.quality);
     this.resize();
-    this.lastT = performance.now();   // swallow the dt accumulated while dark
+    // Swallow the dt accumulated while dark, and everything derived from it — a
+    // restore is a fresh set of shader compiles, not evidence about the GPU.
+    this.lastT = this._prevNow = performance.now();
+    this._acc = 0;
+    this._resetWindow();
+    this._cooldown = CFG.PERF_COOLDOWN;
   }
 
   // ---- run lifecycle -------------------------------------------------------
@@ -391,9 +446,42 @@ class Game {
     // Context is gone: keep the rAF alive so we notice the restore, but neither
     // simulate nor draw. Simulating blind would teleport the player while the
     // screen is dark.
-    if (this.glLost && this.glLost.lost) { this.lastT = now; return; }
+    if (this.glLost && this.glLost.lost) {
+      this.lastT = now; this._prevNow = now; this._acc = 0; return;
+    }
 
-    let rawDt = (now - this.lastT) / 1000;
+    // The raw vsync delta — the DISPLAY's cadence, not ours. At cadence > 1 several
+    // of these fold into one rendered frame, so this is the only signal that can
+    // tell us how fast the panel actually is.
+    const vsync = now - (this._prevNow ?? now);
+    this._prevNow = now;
+    if (vsync > 0) {
+      this._winT += vsync;
+      // Vote for the standard refresh nearest this interval. Anything faster than
+      // any real display is a timing glitch and does not get a vote.
+      if (vsync >= CFG.PERF_MIN_INTERVAL) {
+        this._rBins[nearestRefresh(vsync)]++;
+        this._rVotes++;
+      }
+    }
+
+    // Frame pacing. At cadence 1 every callback passes straight through. Above it,
+    // vsync time accumulates and only every Nth callback does work — which converts
+    // an unstable "somewhere between 120 and 60" into an exact divisor of the
+    // refresh. The 2% slack absorbs vsync jitter so a beat is never missed by a hair.
+    if (this.cadence > 1) {
+      this._acc += vsync;
+      if (this._acc < this.refreshMs * this.cadence * 0.98) return;
+      this._acc = 0;
+    }
+
+    // Interval between RENDERED frames — at cadence 1 identical to `vsync`, above it
+    // the beat we are actually trying to hold. This is what the governor judges.
+    const frameMs = now - this.lastT;
+    this.frameMs = lerp(this.frameMs, frameMs || 16.7, 0.08);
+    this.adaptQuality(frameMs);
+
+    let rawDt = frameMs / 1000;
     this.lastT = now;
     if (!(rawDt > 0)) rawDt = 1 / 60;
     // Never simulate more than a 20fps step. The player's substep budget is sized to
@@ -401,39 +489,140 @@ class Game {
     // the hazards advance by different amounts of time on slow frames.
     rawDt = Math.min(rawDt, CFG.MAX_SIM_DT);
 
-    this.frameMs = lerp(this.frameMs, (now - (this._prevNow || now)) || 16.7, 0.08);
-    this._prevNow = now;
-    this.adaptQuality();
-
     this.input.poll();
     this.update(rawDt);
     this.render();
   }
 
-  adaptQuality() {
-    // Ignore startup: shader compiles and the first chunk generation produce a burst of
-    // slow frames that would otherwise pin the game at minimum resolution forever.
-    if (++this.frameCount < 150) return;
-
-    // Drop internal resolution before we start dropping frames, then claw it back.
-    // Recovery has to be reachable on a 60Hz display — a threshold below the frame
-    // interval itself can never be met, so quality would only ever ratchet down.
-    if (this.frameMs > 20) { this.slowFrames++; this.fastFrames = 0; }
-    else if (this.frameMs < 17.2) { this.fastFrames++; this.slowFrames = 0; }
-    if (this.slowFrames > 45 && this.quality > 0.6) {
-      this.quality = Math.max(0.6, this.quality - 0.15);
-      this.slowFrames = 0;
-      // Shrink the bloom chain with the scene. Post already exposes the hook and
-      // nothing was calling it, so the blur ping-pongs — the most fill-rate-hungry
-      // part of the frame — stayed full size no matter how far quality dropped.
-      this.post.setQuality(this.quality);
-      this.resize();
-    } else if (this.fastFrames > 240 && this.quality < 1) {
-      this.quality = Math.min(1, this.quality + 0.1);
-      this.fastFrames = 0;
-      this.post.setQuality(this.quality);
-      this.resize();
+  /**
+   * The frame-rate governor.
+   *
+   * The previous version smoothed frame times into an EMA and compared it against
+   * two hardcoded 60Hz constants (slow above 20ms, fast below 17.2ms). That cannot
+   * see the failure it exists to catch. Measured on a GPU-bound frame, the deltas
+   * were bimodal — 18% at 8.3ms, 64% at 17-21ms, 5% past 34ms — because consecutive
+   * frames landed on different sides of a vsync boundary. That IS stutter. But the
+   * mean of that distribution is 15.65ms, *under* the 17.2ms "fast" threshold, so
+   * the governor scored 18 seconds of visible judder as spare headroom and took no
+   * action at all. An average cannot detect a distribution straddling a deadline;
+   * only counting the misses can.
+   *
+   * The hardcoded 60Hz was the second half of the bug. On a 120Hz panel the budget
+   * is 8.33ms, so every frame from 8.4 to 17.1ms is a MISSED deadline that the old
+   * code scored as fast — it would have raised quality while dropping every other
+   * frame.
+   *
+   * So: measure the refresh rate rather than assume it, count missed deadlines
+   * rather than average them, and require the miss rate to be SUSTAINED across a
+   * multi-second window. An isolated hiccup — a GC, a chunk, a shader compile — is
+   * not a quality problem and must not be paid for with permanent resolution.
+   */
+  adaptQuality(frameMs) {
+    // Startup: shader compiles and the first chunk generation are a burst of slow
+    // frames that would otherwise pin the game at minimum resolution forever.
+    if (++this.frameCount < 4 || this.time < CFG.PERF_WARMUP) {
+      this._resetWindow();
+      return;
     }
+
+    const budget = this.refreshMs * this.cadence;
+    this._winN++;
+    if (frameMs > budget * CFG.PERF_MISS_TOLERANCE) this._winMiss++;
+
+    // A change is still settling: its reallocation hitch would read as a miss.
+    if (this._cooldown > 0) {
+      this._cooldown -= frameMs / 1000;
+      if (this._cooldown > 0) { this._resetWindow(); return; }
+    }
+
+    if (this._winT < CFG.PERF_WINDOW * 1000 || this._winN < 8) return;
+    const miss = this._winMiss / this._winN;
+
+    // Revise the believed refresh: the fastest standard rate that carried a real
+    // share of this window, ratcheting the high-water mark. Nothing clearing the
+    // threshold leaves the belief alone, which is what stops a non-vsynced context
+    // (or one glitched delta) from being read as an impossibly fast display.
+    if (this._rVotes > 0) {
+      const need = this._rVotes * CFG.PERF_REFRESH_VOTE;
+      for (let i = 0; i < this._refreshIdx; i++) {
+        if (this._rBins[i] >= need) { this._refreshIdx = i; break; }
+      }
+      this.refreshMs = REFRESH_MS[this._refreshIdx];
+    }
+
+    const p = this.perf;
+    p.refreshMs = +this.refreshMs.toFixed(2);
+    p.cadence = this.cadence;
+    p.missRatio = +miss.toFixed(3);
+    p.quality = this.quality;
+    p.fps = Math.round(1000 * this._winN / this._winT);
+
+    if (miss > CFG.PERF_DOWN_RATIO) {
+      this._cleanT = 0;
+      // Pace down BEFORE turning anything down. Halving the rate costs no pixels,
+      // and on a high-refresh panel an exact divisor of the refresh is smoother
+      // than an in-between frame rate at higher resolution.
+      if (this.cadence === 1 && this.refreshMs * 2 <= CFG.PERF_CADENCE_MAX_MS) {
+        this.cadence = 2;
+        this._acc = 0;
+        this._commit();
+      } else if (this.quality > CFG.QUALITY_FLOOR) {
+        this.quality = Math.max(CFG.QUALITY_FLOOR, this.quality - 0.15);
+        this.applyQuality();
+        this._commit();
+      } else {
+        this._resetWindow();   // nothing left to give; stop churning on it
+      }
+      return;
+    }
+
+    if (miss < CFG.PERF_UP_RATIO) {
+      this._cleanT += this._winT / 1000;
+      if (this._cleanT >= CFG.PERF_UP_HOLD * this._probeBackoff) {
+        this._cleanT = 0;
+        if (this.quality < 1) {
+          // Pixels back first: full resolution is worth more than the extra frames.
+          this.quality = Math.min(1, this.quality + 0.1);
+          this.applyQuality();
+          this._commit();
+          return;
+        }
+        if (this.cadence > 1) {
+          // Probe the full refresh again in case conditions changed. If it does not
+          // hold we end up back here, so back the retry off to bound how often that
+          // probe costs a window of stutter.
+          this.cadence = 1;
+          this._acc = 0;
+          this._probeBackoff = Math.min(8, this._probeBackoff * 2);
+          this._commit();
+          return;
+        }
+        this._probeBackoff = 1;   // fully healthy — forget past failures
+      }
+    } else {
+      this._cleanT = 0;
+    }
+    this._resetWindow();
+  }
+
+  /** Push the current quality into the scene target and the bloom chain. */
+  applyQuality() {
+    // Shrink the bloom chain with the scene. Post exposes the hook and nothing was
+    // calling it, so the blur ping-pongs — the most fill-rate-hungry part of the
+    // frame — stayed full size no matter how far quality dropped.
+    this.post.setQuality(this.quality);
+    this.resize();
+  }
+
+  /** Commit a pacing/quality change: swallow the settling hitch, then re-measure. */
+  _commit() {
+    this._cooldown = CFG.PERF_COOLDOWN;
+    this._resetWindow();
+  }
+
+  _resetWindow() {
+    this._winT = 0; this._winN = 0; this._winMiss = 0;
+    this._rBins.fill(0); this._rVotes = 0;
   }
 
   update(rawDt) {

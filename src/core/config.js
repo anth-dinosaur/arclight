@@ -542,6 +542,46 @@ export const CFG = {
   MAX_PARTICLES: 900,
   MAX_INSTANCES: 4096,
   TRAIL_POINTS: 44,
+
+  // ---- frame pacing / adaptive quality ------------------------------------
+  //
+  // The frame cost of this game is ~entirely fill rate: measured, `update()` is
+  // 0.01ms mean against a 15ms `render()`, and GPU time is linear in pixel count
+  // (~10ms per megapixel on a mid GPU, split ~53% scene pass / ~47% bloom chain).
+  // So the only levers are how many pixels we draw and how often we draw them.
+  //
+  // Of those two, DRAWING LESS OFTEN IS THE CHEAPER ONE, and the governor prefers
+  // it. A locked 60fps on a 120Hz panel is perfectly smooth — it is an exact 2:1
+  // divisor of the refresh. What reads as stutter is landing *between* cadences,
+  // where each frame waits a variable number of vsyncs. So a GPU that cannot hold
+  // 120 gets paced down to a clean 60 at FULL resolution, and internal resolution
+  // is only sacrificed when even that cadence cannot be held.
+  RENDER_SCALE: 1.0,          // baseline internal-res multiplier; 1.0 = native
+  QUALITY_FLOOR: 0.5,         // how far resolution may fall as a last resort
+  PERF_WARMUP: 2.0,           // s of shader compiles / first chunks to ignore
+  PERF_WINDOW: 2.5,           // s of frames each verdict is drawn from
+  PERF_MISS_TOLERANCE: 1.5,   // a frame is "missed" past this multiple of budget
+  PERF_DOWN_RATIO: 0.35,      // sustained miss fraction that costs a step
+  PERF_UP_RATIO: 0.05,        // miss fraction under which a step is earned back
+  PERF_UP_HOLD: 6.0,          // s of clean frames before stepping back up
+  PERF_COOLDOWN: 1.0,         // s ignored after a change — the realloc hitch
+  // Refresh detection is a VOTE, not a minimum. The minimum is maximally sensitive
+  // to exactly the thing that goes wrong here: one spurious sub-millisecond delta
+  // (two callbacks inside a vsync, a clock glitch, a non-vsynced headless context)
+  // sets a deadline nothing can meet, and the governor then shreds quality forever
+  // chasing a display that does not exist. Instead every observed interval votes for
+  // the standard refresh rate nearest it, and the believed refresh is the FASTEST
+  // rate carrying at least this share of the window. A real refresh recurs on
+  // essentially every frame; a glitch happens once and is outvoted.
+  PERF_REFRESH_VOTE: 0.10,
+  // Intervals below this are not a presentation cadence at all — no display
+  // refreshes this fast — so they are discarded rather than allowed to vote. If a
+  // window ends with no rate clearing the threshold, the previous belief stands.
+  PERF_MIN_INTERVAL: 4.2,     // ms
+  // Cadence locking is only offered where the halved rate is still good. At 120Hz
+  // it buys a clean 60; at 90Hz it would mean 45, which is worse than a slightly
+  // soft 90, so below this the governor scales resolution instead.
+  PERF_CADENCE_MAX_MS: 17.5,  // ms; refresh*2 must land under this
 };
 
 /**

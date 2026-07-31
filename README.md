@@ -97,4 +97,14 @@ non-zero if anything needs attention.
 
 WebGL2 required (iOS 15+). Falls back to RGBA8 render targets where half-float render
 targets are unavailable, compressing emission at draw time so the HDR look survives.
-Renders at up to 2× DPR with automatic resolution scaling if frame time slips.
+Renders at up to 2× DPR and targets whatever the display's refresh rate actually is,
+measured rather than assumed — 120Hz where the panel offers it.
+
+The frame cost is ~entirely fill rate (`update()` is 0.01ms against a 15ms `render()`,
+and GPU time is linear in pixel count), so the governor in `main.js adaptQuality` has
+two levers and prefers the free one. A GPU that cannot hold the full refresh is first
+paced down to an exact divisor of it — a locked 60 on a 120Hz panel is perfectly smooth,
+since what reads as stutter is landing *between* cadences — and internal resolution is
+only scaled once that is gone. It judges sustained missed deadlines over a multi-second
+window, so an isolated hiccup costs nothing. `tools/dev/governor.mjs` tests all of that;
+`tools/dev/frametime.mjs` and `tools/dev/gpusweep.mjs` measure where the frame goes.
