@@ -108,3 +108,10 @@ since what reads as stutter is landing *between* cadences — and internal resol
 only scaled once that is gone. It judges sustained missed deadlines over a multi-second
 window, so an isolated hiccup costs nothing. `tools/dev/governor.mjs` tests all of that;
 `tools/dev/frametime.mjs` and `tools/dev/gpusweep.mjs` measure where the frame goes.
+
+One condition looks exactly like GPU overload but is not: iOS Low Power Mode halves the
+rAF rate, so every frame is "late" no matter what is drawn. The governor tells the two
+apart by intervention — it drops to floor resolution for one window, and if the misses
+do not move it believes the cap instead, giving every pixel back: full resolution at a
+rock-steady 30 rather than half resolution at the same 30. The belief is dropped the
+moment full-rate intervals reappear.

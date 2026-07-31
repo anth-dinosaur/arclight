@@ -6,6 +6,13 @@
  *   hiccups  — a healthy frame rate with rare long frames. Must NOT act; an isolated
  *              GC or chunk generation is not a quality problem.
  *   recovery — overload that stops. Must claw resolution back, then re-probe cadence.
+ *   capped   — a halved rAF rate (iOS Low Power Mode). Resolution cannot fix it, so
+ *              the governor must probe, believe the cap, and hold FULL resolution at
+ *              a steady 30 — then drop the belief when the cap lifts mid-run.
+ *
+ * The synthetic stalls scale with rendered pixel count because real GPU load does
+ * (fill rate is linear in pixels). A fixed stall would be pixel-invariant — the
+ * signature of a cap, not of load — and would trip the cap probe by construction.
  *
  * Traces the governor's own view (game.perf) so a failure says which input it
  * misread rather than just "quality is wrong".
@@ -17,7 +24,7 @@ const args = Object.fromEntries(
     .map((s) => s.trim().split(/\s+/)).map(([k, ...v]) => [k, v.join(' ') || true])
 );
 const URL_ = args.url || 'http://localhost:8080';
-const CASES = (args.case || 'heavy,hiccups,recovery').split(',');
+const CASES = (args.case || 'heavy,hiccups,recovery,capped').split(',');
 const W = 1440, H = 900;
 
 // Deliberately NOT --disable-frame-rate-limit: the governor's whole job is reasoning
@@ -53,7 +60,7 @@ async function run(name, setup, seconds) {
     window.__iv = setInterval(() => window.__t.trace.push({
       t: +(g.time).toFixed(1), q: +g.quality.toFixed(2), cad: g.cadence,
       refresh: g.perf.refreshMs, miss: g.perf.missRatio, fps: g.perf.fps,
-      px: g.viewW * g.viewH,
+      cap: g.capped ? 1 : 0, px: g.viewW * g.viewH,
     }), 500);
   });
 
@@ -100,10 +107,12 @@ async function run(name, setup, seconds) {
 }
 
 const SETUPS = {
-  // Sustained overload: a hard CPU-side stall on every render, far past any budget.
+  // Sustained overload: a stall on every render that scales with pixels, like real
+  // fill-rate load. 26ms at full res, so floor res (¼ the pixels) comfortably fits.
   heavy: [() => {
     const g = window.game, or = g.render.bind(g);
-    g.render = function () { or(); const t = performance.now(); while (performance.now() - t < 26); };
+    const base = g.viewW * g.viewH;
+    g.render = function () { or(); const ms = 26 * (g.viewW * g.viewH) / base; const t = performance.now(); while (performance.now() - t < ms); };
   }, 26],
 
   // Healthy, with a 40ms stall roughly every 2.5s — the isolated-hiccup case. The
@@ -120,10 +129,11 @@ const SETUPS = {
   // Overload for the first 12s, then it stops. Must claw back.
   recovery: [() => {
     const g = window.game, or = g.render.bind(g);
+    const base = g.viewW * g.viewH;
     const t0 = performance.now();
     g.render = function () {
       or();
-      if (performance.now() - t0 < 12000) { const t = performance.now(); while (performance.now() - t < 26); }
+      if (performance.now() - t0 < 12000) { const ms = 26 * (g.viewW * g.viewH) / base; const t = performance.now(); while (performance.now() - t < ms); }
     };
   }, 40],
 
@@ -135,6 +145,16 @@ const SETUPS = {
     g._refreshIdx = 1; g.refreshMs = 1000 / 120;   // pretend ProMotion
     g.render = function () { or(); const t = performance.now(); while (performance.now() - t < 12); };
   }, 26],
+
+  // iOS Low Power Mode: rAF delivers every OTHER vsync, and no amount of resolution
+  // changes that. Expected arc: probe (one window at floor), believe the cap, restore
+  // quality 1.0 at a steady 30. At t=18s the cap lifts; the belief must drop and the
+  // game must return to full-rate frames without giving up any resolution.
+  capped: [() => {
+    const raf0 = window.requestAnimationFrame.bind(window);
+    window.requestAnimationFrame = (cb) => raf0(() => raf0(cb));
+    setTimeout(() => { window.requestAnimationFrame = raf0; }, 18000);
+  }, 32],
 };
 
 for (const c of CASES) {
@@ -144,7 +164,7 @@ for (const c of CASES) {
   console.log(`final:  quality=${r.quality}  cadence=${r.cadence}  refresh=${r.refreshMs}ms  miss=${r.missRatio}`);
   console.log(`paced:  ${r.renderedFps} fps  p50=${r.renderedMs.p50}ms p95=${r.renderedMs.p95}ms p99=${r.renderedMs.p99}ms  jitter=${r.jitter}`);
   console.log(`vsync:  p50=${r.vsyncP50}ms`);
-  console.log('trace:  ' + r.trace.map((x) => `${x.t}s q${x.q}/c${x.cad}/m${x.miss}`).join('  '));
+  console.log('trace:  ' + r.trace.map((x) => `${x.t}s q${x.q}/c${x.cad}/m${x.miss}${x.cap ? '/CAP' : ''}`).join('  '));
   if (r.errors.length) console.log('ERRORS: ' + r.errors.slice(0, 3).join(' | '));
 }
 await browser.close();

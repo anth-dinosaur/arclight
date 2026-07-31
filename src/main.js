@@ -19,17 +19,22 @@ const STATE = { TITLE: 0, PLAY: 1, DYING: 2, DEAD: 3 };
 // Standard display intervals, ms, fastest first. Quantising measured intervals to
 // this list strips vsync jitter and keeps the deadline a number a panel can hit.
 //
-// The list stops at 60Hz, and that is load-bearing rather than lazy. From rAF
-// deltas alone "a 30Hz display" and "a 60Hz display where we miss every other
+// Belief-by-vote stops at 60Hz, and that is load-bearing rather than lazy. From rAF
+// deltas alone "a 30Hz presentation" and "a 60Hz display where we miss every other
 // vsync" are the SAME OBSERVATION — steady 33ms callbacks — and no browser API
-// exposes the real refresh rate to disambiguate them. Since a display slower than
-// 60Hz essentially does not exist, while a 60Hz display we are only half keeping up
-// with is the single most common way this game runs badly, the tie is broken toward
-// the latter every time. The cost of being wrong is a reduced internal resolution
-// during a battery-saver rAF cap, which is roughly what you want there anyway.
-const REFRESH_MS = [1000 / 144, 1000 / 120, 1000 / 90, 1000 / 60];
-/** Slowest refresh the governor will ever believe in — see above. */
-const REFRESH_SLOWEST = REFRESH_MS.length - 1;
+// exposes the real refresh rate to disambiguate them. A display slower than 60Hz
+// essentially does not exist, while a 60Hz display we are only half keeping up with
+// is the single most common way this game runs badly, so votes alone never move the
+// belief below 60. The final 30Hz slot exists for the one case that genuinely does
+// present that slowly — a rAF cap, e.g. iOS Low Power Mode — and is reachable only
+// through the intervention probe described at CFG.PERF_CAP_MISS, never by votes.
+// (The slot still collects votes: that is how the doubled beat is recognised going
+// in, and how its disappearance is recognised coming out.)
+const REFRESH_MS = [1000 / 144, 1000 / 120, 1000 / 90, 1000 / 60, 1000 / 30];
+/** Slowest refresh VOTES may believe (60Hz) — see above; the ratchet stops here. */
+const REFRESH_SLOWEST = REFRESH_MS.length - 2;
+/** The presentation-cap slot (30Hz), reachable only by the cap probe. */
+const REFRESH_CAP = REFRESH_MS.length - 1;
 
 /** Index of the standard display interval nearest a measured one. */
 function nearestRefresh(ms) {
@@ -183,8 +188,11 @@ class Game {
     this._cleanT = 0;           // consecutive clean time, for stepping back up
     this._cooldown = 0;
     this._probeBackoff = 1;     // grows after a failed cadence-1 probe
+    /** Presentation-capped (e.g. Low Power Mode) — see CFG.PERF_CAP_MISS. */
+    this.capped = false;
+    this._capProbe = false;     // floor-res probe in flight to confirm a suspected cap
     /** Diagnostics, for tools/dev. Rewritten each verdict, never reallocated. */
-    this.perf = { refreshMs: 16.7, cadence: 1, missRatio: 0, quality: 1, fps: 60 };
+    this.perf = { refreshMs: 16.7, cadence: 1, missRatio: 0, quality: 1, fps: 60, capped: false };
 
     // ---- state handed to subsystems (preallocated, never reallocated) ------
     this.postState = {
@@ -525,7 +533,7 @@ class Game {
       return;
     }
 
-    const budget = this.refreshMs * this.cadence;
+    const budget = this.capped ? REFRESH_MS[REFRESH_CAP] : this.refreshMs * this.cadence;
     this._winN++;
     if (frameMs > budget * CFG.PERF_MISS_TOLERANCE) this._winMiss++;
 
@@ -550,19 +558,61 @@ class Game {
       this.refreshMs = REFRESH_MS[this._refreshIdx];
     }
 
+    // How much of the window sat exactly on the doubled beat. This is the signature
+    // of a presentation cap — and of nothing else the governor can fix with pixels.
+    const capShare = this._rVotes > 0 ? this._rBins[REFRESH_CAP] / this._rVotes : 0;
+
     const p = this.perf;
     p.refreshMs = +this.refreshMs.toFixed(2);
     p.cadence = this.cadence;
     p.missRatio = +miss.toFixed(3);
     p.quality = this.quality;
     p.fps = Math.round(1000 * this._winN / this._winT);
+    p.capped = this.capped;
+
+    // ---- presentation cap (see CFG.PERF_CAP_MISS) --------------------------
+    if (this.capped) {
+      // The cap lifts (Low Power Mode off, ProMotion back): real vsync intervals
+      // reappear and the doubled beat vanishes. Drop the belief and re-measure.
+      if (this._rVotes >= 8 && 1 - capShare >= CFG.PERF_CAP_EXIT) {
+        this.capped = false;
+        this._commit();
+        return;
+      }
+    } else if (miss >= CFG.PERF_CAP_MISS && capShare >= CFG.PERF_CAP_VOTE) {
+      // Every frame is late and every interval sits on the doubled beat. Either the
+      // GPU takes one-to-two refreshes per frame — which floor resolution would fix,
+      // fill rate being linear in pixels — or nothing we draw changes when the
+      // callback fires, because the rate is capped. Only intervening can tell them
+      // apart: probe at floor resolution, and if the misses do not move, believe the
+      // cap and stop paying pixels for a deadline pixels cannot buy.
+      if (this._capProbe || this.quality <= CFG.QUALITY_FLOOR) {
+        this._capProbe = false;
+        this.capped = true;
+        this.cadence = 1;       // pacing on top of a cap would halve the rate again
+        this._acc = 0;
+        this.quality = 1;       // every step down was taken on a false premise
+        this.applyQuality();
+        this._commit();
+        return;
+      }
+      this._capProbe = true;
+      this.quality = CFG.QUALITY_FLOOR;
+      this.applyQuality();
+      this._commit();
+      return;
+    } else if (this._capProbe) {
+      // Floor resolution moved the misses after all: real fill-rate load, not a cap.
+      // Keep the cheap frame and let the up path climb back to what sustains.
+      this._capProbe = false;
+    }
 
     if (miss > CFG.PERF_DOWN_RATIO) {
       this._cleanT = 0;
       // Pace down BEFORE turning anything down. Halving the rate costs no pixels,
       // and on a high-refresh panel an exact divisor of the refresh is smoother
       // than an in-between frame rate at higher resolution.
-      if (this.cadence === 1 && this.refreshMs * 2 <= CFG.PERF_CADENCE_MAX_MS) {
+      if (!this.capped && this.cadence === 1 && this.refreshMs * 2 <= CFG.PERF_CADENCE_MAX_MS) {
         this.cadence = 2;
         this._acc = 0;
         this._commit();

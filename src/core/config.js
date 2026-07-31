@@ -582,6 +582,23 @@ export const CFG = {
   // it buys a clean 60; at 90Hz it would mean 45, which is worse than a slightly
   // soft 90, so below this the governor scales resolution instead.
   PERF_CADENCE_MAX_MS: 17.5,  // ms; refresh*2 must land under this
+  // A presentation CAP is the one condition the miss counter cannot see through.
+  // iOS Safari in Low Power Mode halves the rAF rate, so every callback lands a
+  // steady two vsyncs apart. To the governor that is "a 60Hz display missing every
+  // deadline", and it would shred resolution chasing a GPU problem that does not
+  // exist — ending at half res AND 30fps, the worst of both. From rAF deltas alone
+  // the two cases are the same observation; what disambiguates them is INTERVENTION.
+  // GPU time is linear in pixel count, so when ~every frame is late (CAP_MISS) and
+  // ~every interval sits on the doubled beat (CAP_VOTE), the governor drops to floor
+  // resolution for one window as a probe. If the misses do not move, the deadline is
+  // not fill-rate-bound: it believes the cap, sets the budget to the capped interval,
+  // and gives every pixel back — full resolution at a rock-steady 30 instead of half
+  // resolution at the same 30. (This also catches any load that resolution cannot
+  // fix, where full res at the achievable steady rate is likewise the best answer.)
+  // The cap is dropped again the moment faster intervals reappear (CAP_EXIT).
+  PERF_CAP_MISS: 0.85,        // miss fraction meaning ~every frame is late
+  PERF_CAP_VOTE: 0.75,        // interval share on the doubled beat to suspect a cap
+  PERF_CAP_EXIT: 0.50,        // share of faster intervals that proves the cap lifted
 };
 
 /**

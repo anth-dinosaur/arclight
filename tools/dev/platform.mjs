@@ -736,8 +736,12 @@ async function t9() {
     const g = window.game;
     window.__q = [];
     const or = g.render.bind(g);
-    g.render = function () { or(); const t = performance.now(); while (performance.now() - t < 26); };  // force ~26ms frames
-    const iv = setInterval(() => window.__q.push({ q: g.quality, postQ: g.post.quality, w: g.post.w, mip0: g.post.mipW[0], frameMs: +g.frameMs.toFixed(1), cadence: g.cadence, miss: g.perf.missRatio, refresh: g.perf.refreshMs }), 250);
+    // ~26ms at full res, scaling with pixels like real fill-rate load. A fixed stall
+    // is pixel-invariant — the signature of a rAF cap — and would (correctly) make
+    // the governor believe a cap and RESTORE resolution, which is not this check.
+    const base = g.viewW * g.viewH;
+    g.render = function () { or(); const ms = 26 * (g.viewW * g.viewH) / base; const t = performance.now(); while (performance.now() - t < ms); };
+    const iv = setInterval(() => window.__q.push({ q: g.quality, postQ: g.post.quality, w: g.post.w, mip0: g.post.mipW[0], frameMs: +g.frameMs.toFixed(1), cadence: g.cadence, miss: g.perf.missRatio, refresh: g.perf.refreshMs, cap: g.capped ? 1 : 0 }), 250);
     setTimeout(() => clearInterval(iv), 14000);
   });
   // The governor now judges over multi-second windows by design, so a degradation
