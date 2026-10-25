@@ -10,6 +10,20 @@ npm start          # serves on 0.0.0.0:8080, prints the LAN address
 
 Then open the printed `network` URL on your phone. Add to Home Screen for fullscreen.
 
+It is also published at **https://anth-dinosaur.github.io/arclight/** — open that in
+Safari and Add to Home Screen for an install that works fully offline.
+
+```
+npm run build      # copy the shipped files to dist/ and stamp sw.js with a content hash
+npm run deploy     # build, then force-push dist/ to the gh-pages branch
+npm run offline    # offline check against `npm start` (or --url ...)
+```
+
+Every push to `master` deploys automatically (`.github/workflows/deploy.yml`). The
+service worker is versioned by a content hash of the shipped files, so there is no
+version to bump. A new file under `src/` must be added to `SHELL` in `sw.js`; the build
+fails if the two drift.
+
 ## How to play
 
 **Hold anywhere.** A light-tether fires at the best anchor ahead and you swing.
@@ -62,6 +76,7 @@ contain a magic number or a colour.
 
 ```
 node tools/probe.mjs --out shots/x       # headless iPhone playthrough + screenshots
+node tools/offline.mjs [--url ...]       # installed-app offline cold launch + cache isolation
 node tools/dev/sim2.mjs                  # headless gameplay sim, 30 seeds, 3 bots
 node tools/dev/platform.mjs [t4,t6]      # iPhone-Safari platform acceptance, 10 checks
 node tools/dev/analyze.mjs <png...>      # luminance/saturation/black-point analysis

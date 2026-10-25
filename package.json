@@ -6,7 +6,10 @@
   "description": "A one-thumb neon traversal game for iPhone Safari.",
   "scripts": {
     "start": "node server.js",
-    "probe": "node tools/probe.mjs"
+    "probe": "node tools/probe.mjs",
+    "build": "node scripts/build.js",
+    "deploy": "node scripts/deploy.js",
+    "offline": "node tools/offline.mjs"
   },
   "devDependencies": {
     "playwright": "^1.62.0"

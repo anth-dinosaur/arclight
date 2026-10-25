@@ -6,6 +6,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { networkInterfaces } from 'node:os';
+import { stampWorker } from './scripts/ship.js';
 
 const ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const PORT = Number(process.env.PORT) || 8080;
@@ -48,7 +49,7 @@ const server = createServer(async (req, res) => {
     if (info.isDirectory()) { res.writeHead(404).end('Not found'); return; }
 
     const ext = extname(target).toLowerCase();
-    const body = await readFile(target);
+    let body = await readFile(target);
     const headers = {
       'Content-Type': TYPES[ext] || 'application/octet-stream',
       'Content-Length': body.length,
@@ -60,6 +61,9 @@ const server = createServer(async (req, res) => {
     };
     // A stale service worker outlives a reload; it must never be served from cache.
     if (path.endsWith('/sw.js')) {
+      // Stamp the content hash so an edit anywhere installs a fresh worker + cache.
+      body = Buffer.from(stampWorker(body.toString()));
+      headers['Content-Length'] = body.length;
       headers['Cache-Control'] = 'no-cache';
       headers['Service-Worker-Allowed'] = '/';
     }

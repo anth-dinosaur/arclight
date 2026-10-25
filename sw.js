@@ -2,14 +2,21 @@
 //
 // The whole game is a fixed set of static files with no backend, so the cache
 // strategy is the simplest one that works: precache the shell on install, serve
-// cache-first, and fall back to the network for anything not listed. Bump
-// VERSION to ship an update — activate deletes every other cache, so a stale
-// build can never half-survive alongside a new one.
+// cache-first, and fall back to the network for anything not listed.
+//
+// BUILD is stamped with a content hash of the shipped files (server.js when
+// serving, scripts/build.js for Pages), so any edit yields a new worker and a new
+// cache, and activate deletes the old one — a stale build can never half-survive
+// alongside a new one. Only caches with our own prefix are touched: on
+// *.github.io every project shares one origin, and so one CacheStorage, with the
+// other games published there.
 //
 // Registration is gated on a secure context in index.html, so this never runs
 // when the dev server is reached over a LAN IP.
 
-const VERSION = 'arclight-v1';
+const BUILD = '__BUILD_VERSION__';
+const PREFIX = 'arclight-';
+const VERSION = PREFIX + BUILD;
 
 const SHELL = [
   './',
@@ -40,9 +47,10 @@ const SHELL = [
 self.addEventListener('install', (e) => {
   e.waitUntil(
     caches.open(VERSION)
-      // One bad entry must not fail the whole install, or a single renamed file
-      // leaves the app with no offline shell at all.
-      .then((c) => Promise.all(SHELL.map((u) => c.add(u).catch(() => {}))))
+      // All or nothing: a partial shell would install a worker that cannot run
+      // offline. `reload` bypasses the HTTP cache so a new build never precaches
+      // an old file. scripts/build.js fails if SHELL and the shipped files drift.
+      .then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' }))))
       .then(() => self.skipWaiting())
   );
 });
@@ -50,7 +58,7 @@ self.addEventListener('install', (e) => {
 self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => k.startsWith(PREFIX) && k !== VERSION).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
