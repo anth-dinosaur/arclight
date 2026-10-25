@@ -28,8 +28,13 @@ const LAYER_ADDITIVE = [true, false, true, true];
 
 const FLOATS_PER_INSTANCE = 16;
 
+// Fragments contributing less than this are discarded; the vertex shader sizes
+// each quad to exactly this cutoff, so the two must agree.
+const AMOUNT_MIN = '0.0015';
+
 const VS = `#version 300 es
 precision highp float;
+#define AMOUNT_MIN ${AMOUNT_MIN}
 
 // Per-instance
 layout(location=0) in vec4 i_xform;   // cx, cy, halfW, halfH
@@ -57,9 +62,26 @@ void main() {
   if (gl_VertexID == 4) corner = vec2(-1.0,  1.0);
   if (gl_VertexID == 5) corner = vec2( 1.0,  1.0);
 
+  // Size the quad to exactly where the fragment shader stops producing output —
+  // the same AMOUNT_MIN cutoff it discards at. Every fragment past that runs the
+  // full SDF + exp() only to be thrown away, and at native 3x that was most of the
+  // frame: a fixed 3*glowRadius pad on every shape, including the majority with
+  // glow 0, shaded ~2.5x the fragments that could ever reach the target.
   vec2 half_ = i_xform.zw;
-  float pad = i_fx.y * 3.0 + i_fx.z + 1.0;   // room for the halo to fade out in
-  vec2 ext = half_ + pad;
+  float g = i_fx.x;
+  vec2 ext;
+  if (i_shape.y > 3.5) {
+    // GLOW: exp(-rr^2 * 3.2) * g falls under the cutoff at rr = sqrt(ln(g/min)/3.2).
+    float c = log(max(g, AMOUNT_MIN) / AMOUNT_MIN);
+    ext = half_ * sqrt(c / 3.2) + 1.0;
+  } else {
+    // Halo: exp(-1.4x^2 - 0.6x) * g falls under the cutoff at the root of
+    // 1.4x^2 + 0.6x = ln(g/min), x in glowRadius units. The core needs SOFT
+    // past the edge; a ring's band sits THICKNESS outside its radius.
+    float c = log(max(g, AMOUNT_MIN) / AMOUNT_MIN);
+    float x = (sqrt(0.36 + 5.6 * c) - 0.6) / 2.8;
+    ext = half_ + (x * max(i_fx.y, 1e-3) + i_fx.z + i_fx.w + 1.0);
+  }
 
   v_local = corner * ext;
   v_half  = half_;
@@ -91,6 +113,7 @@ void main() {
 
 const FS = `#version 300 es
 precision highp float;
+#define AMOUNT_MIN ${AMOUNT_MIN}
 
 in vec2 v_local;
 in vec2 v_half;
@@ -148,7 +171,7 @@ void main() {
     float rr = length(v_local / max(v_half, vec2(1e-4)));
     float g = exp(-rr * rr * 3.2);
     float amt = g * v_fx.x;
-    if (amt < 0.0015) discard;
+    if (amt < AMOUNT_MIN) discard;
     fragColor = vec4(v_color.rgb * amt * v_color.a, 0.0);
     return;
   }
@@ -176,7 +199,7 @@ void main() {
   float halo = exp(-od * od * 1.4 - od * 0.6);
 
   float amount = core + halo * glowStrength;
-  if (amount < 0.0015) discard;
+  if (amount < AMOUNT_MIN) discard;
 
   fragColor = vec4(v_color.rgb * amount * v_color.a, core * v_color.a);
 }`;
