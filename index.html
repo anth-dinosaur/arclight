@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ARCLIGHT</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#04030c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ARCLIGHT">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="description" content="ARCLIGHT — a one-thumb neon traversal game.">
+<link rel="manifest" href="manifest.webmanifest">
+<!-- iOS does not accept SVG for the Home Screen. Without a real apple-touch-icon
+     it installs a blurry screenshot of the page instead. -->
+<link rel="apple-touch-icon" sizes="180x180" href="icon-180.png">
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="stylesheet" href="src/ui/ui.css">
+</head>
+<body>
+  <canvas id="gl"></canvas>
+  <div id="hud" aria-hidden="true"></div>
+  <div id="screens"></div>
+  <div id="perf" aria-hidden="true"></div>
+  <noscript><p class="noscript">ARCLIGHT needs JavaScript.</p></noscript>
+  <script type="module" src="src/main.js"></script>
+  <script>
+    // Offline shell. An installed Home Screen app with no service worker just
+    // shows Safari's offline error on launch, which is most of what "installable"
+    // is worth. Registration is only legal in a secure context, so this is a
+    // no-op — silently — when the game is served over a LAN IP for device testing.
+    if ('serviceWorker' in navigator && window.isSecureContext) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function () { /* offline is optional */ });
+      });
+    }
+  </script>
+</body>
+</html>
